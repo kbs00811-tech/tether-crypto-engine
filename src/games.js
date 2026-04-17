@@ -1,0 +1,186 @@
+/**
+ * 8개 크립토 게임 — 서버 사이드 로직
+ * 모든 결과는 Provably Fair 해시에서 결정
+ */
+const { hashToFloat, hashToInt } = require('./provablyFair')
+
+// ═══════════════════════════════════════
+// 1. CRASH — 로켓 배수 게임
+// ═══════════════════════════════════════
+// RTP: 97% (h%33===0 → 즉사 = 3.03% 하우스 엣지)
+function crash(hash) {
+  const h = parseInt(hash.slice(0, 13), 16)
+  const e = Math.pow(2, 52)
+
+  // 3.03% 즉사
+  if (h % 33 === 0) return { crashPoint: 1.00 }
+
+  const crashPoint = Math.floor((100 * e) / (e - h)) / 100
+  return { crashPoint: Math.min(crashPoint, 100000) }
+}
+
+// ═══════════════════════════════════════
+// 2. DICE — 주사위 (0~100 범위)
+// ═══════════════════════════════════════
+// RTP: 97% (배당에 0.97 반영)
+function dice(hash, params) {
+  const roll = hashToInt(hash, 10000) / 100  // 0.00 ~ 100.00
+  const target = Number(params.target) || 50
+  const isOver = params.direction === 'over'
+
+  const won = isOver ? (roll > target) : (roll < target)
+  const winChance = isOver ? (100 - target) : target
+  const multiplier = won ? parseFloat((97 / winChance).toFixed(4)) : 0
+
+  return { roll, target, direction: params.direction, won, multiplier, winChance }
+}
+
+// ═══════════════════════════════════════
+// 3. MINES — 지뢰 찾기
+// ═══════════════════════════════════════
+// RTP: 97% (배당에 0.97 반영)
+function mines(hash, params) {
+  const mineCount = Math.min(24, Math.max(1, Number(params.mines) || 3))
+
+  // Fisher-Yates 셔플로 지뢰 배치
+  const positions = Array.from({ length: 25 }, (_, i) => i)
+  for (let i = 24; i > 0; i--) {
+    const j = hashToInt(hash, i, (24 - i) * 2 % 56)
+    ;[positions[i], positions[j]] = [positions[j], positions[i]]
+  }
+  const minePositions = positions.slice(0, mineCount).sort((a, b) => a - b)
+
+  return { mines: minePositions, mineCount, gridSize: 25 }
+}
+
+// Mines 배당 계산 (n번째 안전 타일 오픈 후)
+function minesMultiplier(mineCount, revealedCount) {
+  if (revealedCount <= 0) return 1
+  let mult = 1
+  for (let i = 0; i < revealedCount; i++) {
+    mult *= (25 - mineCount - i) > 0 ? (25 - i) / (25 - mineCount - i) : 1
+  }
+  return parseFloat((mult * 0.97).toFixed(4))
+}
+
+// ═══════════════════════════════════════
+// 4. PLINKO — 핀볼 낙하
+// ═══════════════════════════════════════
+// RTP: ~97% (배당 테이블로 조정)
+function plinko(hash, params) {
+  const rows = 16
+  const risk = params.risk || 'medium'
+
+  // 각 핀에서 좌(0)/우(1)
+  const path = []
+  let position = 0
+  for (let i = 0; i < rows; i++) {
+    const bit = hashToInt(hash, 1, (i * 2) % 56)
+    path.push(bit)
+    position += bit
+  }
+
+  // 배당 테이블 (17슬롯, 0~16)
+  const payouts = {
+    low:    [16, 9, 2, 1.4, 1.4, 1.2, 1.1, 1.0, 0.5, 1.0, 1.1, 1.2, 1.4, 1.4, 2, 9, 16],
+    medium: [110, 41, 10, 5, 3, 1.5, 1, 0.5, 0.3, 0.5, 1, 1.5, 3, 5, 10, 41, 110],
+    high:   [1000, 130, 26, 9, 4, 2, 0.2, 0.2, 0.2, 0.2, 0.2, 2, 4, 9, 26, 130, 1000],
+  }
+  const table = payouts[risk] || payouts.medium
+  const slot = Math.min(position, table.length - 1)
+  const multiplier = table[slot]
+
+  return { path, slot, multiplier, risk, rows }
+}
+
+// ═══════════════════════════════════════
+// 5. UP/DOWN — 60초 가격 예측
+// ═══════════════════════════════════════
+// RTP: 97.5% (배당 1.95x × 50%)
+function updownSettle(startPrice, endPrice, side) {
+  let won = false
+  if (side === 'UP' && endPrice > startPrice) won = true
+  if (side === 'DOWN' && endPrice < startPrice) won = true
+  // 동가 → 무승부 (환불)
+  if (endPrice === startPrice) return { won: false, tie: true, multiplier: 1.0 }
+
+  return { won, tie: false, multiplier: won ? 1.95 : 0 }
+}
+
+// ═══════════════════════════════════════
+// 6. HI/LO — 목표가 예측
+// ═══════════════════════════════════════
+// RTP: 97% (배당 1.97x)
+function hiloSettle(targetPrice, endPrice, side) {
+  let won = false
+  if (side === 'HIGHER' && endPrice > targetPrice) won = true
+  if (side === 'LOWER' && endPrice < targetPrice) won = true
+  if (endPrice === targetPrice) return { won: false, tie: true, multiplier: 1.0 }
+
+  return { won, tie: false, multiplier: won ? 1.97 : 0 }
+}
+
+// ═══════════════════════════════════════
+// 7. SPREAD — 가격 범위 예측 (180초)
+// ═══════════════════════════════════════
+// RTP: 95%
+function spreadSettle(startPrice, endPrice, spreadPct) {
+  const high = startPrice * (1 + spreadPct)
+  const low = startPrice * (1 - spreadPct)
+  const inRange = endPrice >= low && endPrice <= high
+
+  // 스프레드별 배당
+  let payout = 1.2
+  if (spreadPct <= 0.005) payout = 3.5
+  else if (spreadPct <= 0.01) payout = 2.2
+  else if (spreadPct <= 0.02) payout = 1.6
+
+  return { won: inRange, multiplier: inRange ? payout : 0, rangeHigh: high, rangeLow: low }
+}
+
+// ═══════════════════════════════════════
+// 8. FUTURES — 레버리지 포지션
+// ═══════════════════════════════════════
+// RTP: ~94% (수수료 + 스프레드)
+function futuresSettle(entryPrice, exitPrice, side, leverage, amount) {
+  const fee = 0.001  // 0.1% 수수료
+  const diff = exitPrice - entryPrice
+  const pctChange = diff / entryPrice
+  const leveragedPct = side === 'LONG' ? pctChange * leverage : -pctChange * leverage
+
+  // 청산 체크 (90% 손실)
+  const isLiquidated = leveragedPct <= -0.9
+
+  const grossPnl = isLiquidated ? -amount * 0.9 : amount * leveragedPct
+  const feeAmount = amount * fee * 2  // 진입 + 청산
+  const netPnl = grossPnl - feeAmount
+
+  const payout = Math.max(0, amount + netPnl)
+  const multiplier = payout / amount
+
+  return {
+    won: netPnl > 0,
+    isLiquidated,
+    pctChange: parseFloat((pctChange * 100).toFixed(4)),
+    leveragedPct: parseFloat((leveragedPct * 100).toFixed(2)),
+    grossPnl: Math.floor(grossPnl),
+    feeAmount: Math.floor(feeAmount),
+    netPnl: Math.floor(netPnl),
+    payout: Math.floor(payout),
+    multiplier: parseFloat(multiplier.toFixed(4)),
+  }
+}
+
+// 청산가 계산
+function futuresLiquidationPrice(entryPrice, side, leverage) {
+  const pct = 0.9 / leverage
+  return side === 'LONG'
+    ? parseFloat((entryPrice * (1 - pct)).toFixed(2))
+    : parseFloat((entryPrice * (1 + pct)).toFixed(2))
+}
+
+module.exports = {
+  crash, dice, mines, minesMultiplier, plinko,
+  updownSettle, hiloSettle, spreadSettle,
+  futuresSettle, futuresLiquidationPrice,
+}
