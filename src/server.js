@@ -556,6 +556,238 @@ app.get('/api/price/:symbol', async (req, res) => {
   res.json({ success: true, symbol: req.params.symbol, price })
 })
 
+// ═══════════════════════════════════════════════════
+// B2B API — 게임 공급 엔드포인트
+// ═══════════════════════════════════════════════════
+const {
+  b2bAuthMiddleware, walletDebit, walletCredit, walletRollback,
+  registerTenant, getAllTenants, updateTenantStats,
+  setTenantRTP, setTenantRigging,
+} = require('./b2bAuth')
+
+// ── 업체 등록 (마스터 어드민만)
+app.post('/b2b/auth/register', (req, res) => {
+  const MASTER_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
+  if (req.body?.masterKey !== MASTER_KEY) return res.status(403).json({ success: false, error: 'unauthorized' })
+
+  const tenant = registerTenant(req.body)
+  console.log(`[B2B] New tenant: ${tenant.name} (${tenant.id})`)
+  res.json({ success: true, tenant: { id: tenant.id, name: tenant.name, apiKey: tenant.apiKey, apiSecret: tenant.apiSecret } })
+})
+
+// ── 업체 목록 (마스터 어드민)
+app.get('/b2b/tenants', (req, res) => {
+  const MASTER_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
+  if (req.query.masterKey !== MASTER_KEY && req.headers['x-master-key'] !== MASTER_KEY) {
+    return res.status(403).json({ success: false, error: 'unauthorized' })
+  }
+  const list = getAllTenants().map(t => ({
+    id: t.id, name: t.name, currency: t.currency, status: t.status,
+    revenueShare: t.revenueShare, stats: t.stats, allowedGames: t.allowedGames,
+    createdAt: t.createdAt,
+  }))
+  res.json({ success: true, tenants: list })
+})
+
+// ── B2B 게임 플레이 (Seamless Wallet 연동)
+app.post('/b2b/game/play', b2bAuthMiddleware, async (req, res) => {
+  try {
+    const tenant = req.tenant
+    const { game, playerId, amount, params = {} } = req.body
+
+    if (!game || !playerId || !amount) {
+      return res.json({ success: false, error: 'game, playerId, amount required' })
+    }
+    if (!tenant.allowedGames.includes(game)) {
+      return res.json({ success: false, error: `game ${game} not allowed for this tenant` })
+    }
+
+    const betAmount = Math.floor(Number(amount))
+    const txId = `${tenant.id}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+
+    // 1. Wallet Debit (업체 잔액 차감)
+    const debitRes = await walletDebit(tenant, playerId, betAmount, txId, `${game}_bet`)
+    if (!debitRes.success) {
+      return res.json({ success: false, error: debitRes.error || 'wallet debit failed' })
+    }
+
+    // 2. 게임 결과 계산
+    const seedSet = createSeedSet(params.clientSeed || 'default')
+    seedSet.nonce = Number(params.nonce) || Math.floor(Math.random() * 1000000)
+    const hash = getResultHash(seedSet)
+
+    let gameResult, result = 'lose', payout = 0, multiplier = 0
+
+    switch (game) {
+      case 'crash': {
+        gameResult = crash(hash)
+        const target = Number(params.cashoutAt) || 2.0
+        if (gameResult.crashPoint >= target) { result = 'win'; multiplier = target; payout = Math.floor(betAmount * target) }
+        else { multiplier = gameResult.crashPoint }
+        break
+      }
+      case 'dice': {
+        gameResult = dice(hash, params)
+        if (gameResult.won) { result = 'win'; multiplier = gameResult.multiplier; payout = Math.floor(betAmount * multiplier) }
+        break
+      }
+      case 'plinko': {
+        gameResult = plinko(hash, params)
+        multiplier = gameResult.multiplier; payout = Math.floor(betAmount * multiplier)
+        result = payout > betAmount ? 'win' : 'lose'
+        break
+      }
+      default:
+        // 지원 안 하는 즉시 게임 → 롤백
+        await walletRollback(tenant, playerId, txId, 'unsupported_game')
+        return res.json({ success: false, error: `use /b2b/game/settle for ${game}` })
+    }
+
+    // 3. Wallet Credit (승리 시)
+    if (payout > 0) {
+      const creditRes = await walletCredit(tenant, playerId, payout, `${txId}_win`, `${game}_win`)
+      if (!creditRes.success) {
+        console.error(`[B2B] Credit failed for ${tenant.name}:`, creditRes.error)
+      }
+    }
+
+    // 4. 통계 업데이트
+    updateTenantStats(tenant.id, betAmount, payout)
+    updateRTP(game, betAmount, payout)
+
+    return res.json({
+      success: true, game, result, payout, multiplier, betAmount,
+      transactionId: txId,
+      balance: debitRes.balance != null ? (debitRes.balance - betAmount + payout) : undefined,
+      gameData: gameResult,
+      seed: { serverSeed: seedSet.serverSeed, serverSeedHash: seedSet.serverSeedHash, clientSeed: seedSet.clientSeed, nonce: seedSet.nonce },
+    })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// ── B2B 가격 게임 정산
+app.post('/b2b/game/settle', b2bAuthMiddleware, async (req, res) => {
+  try {
+    const tenant = req.tenant
+    const { game, playerId, amount, params = {} } = req.body
+
+    if (!game || !playerId || !amount) return res.json({ success: false, error: 'game, playerId, amount required' })
+
+    const betAmount = Math.floor(Number(amount))
+    const coin = params.coin || 'BTCUSDT'
+    const endPrice = Number(params.endPrice) || await getBinancePrice(coin)
+    if (!endPrice) return res.json({ success: false, error: 'price unavailable' })
+
+    const txId = `${tenant.id}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    let gameResult, payout = 0
+
+    // 리깅 체크
+    const roundId = params.roundId || `${game}_${Date.now()}`
+    const side = params.side
+    const losingSide = getLosingSide(game, roundId)
+    const riggingOverride = side ? overrideResult(side, losingSide) : null
+
+    switch (game) {
+      case 'updown': {
+        gameResult = updownSettle(Number(params.startPrice), endPrice, side)
+        if (riggingOverride === 'lose' && gameResult.won) { gameResult.won = false; gameResult.multiplier = 0 }
+        else if (riggingOverride === 'win' && !gameResult.won && !gameResult.tie) { gameResult.won = true; gameResult.multiplier = 1.95 }
+        payout = gameResult.tie ? betAmount : (gameResult.won ? Math.floor(betAmount * gameResult.multiplier) : 0)
+        break
+      }
+      case 'hilo': {
+        gameResult = hiloSettle(Number(params.targetPrice), endPrice, side)
+        if (riggingOverride === 'lose' && gameResult.won) { gameResult.won = false; gameResult.multiplier = 0 }
+        else if (riggingOverride === 'win' && !gameResult.won && !gameResult.tie) { gameResult.won = true; gameResult.multiplier = 1.97 }
+        payout = gameResult.tie ? betAmount : (gameResult.won ? Math.floor(betAmount * gameResult.multiplier) : 0)
+        break
+      }
+      case 'spread': {
+        gameResult = spreadSettle(Number(params.startPrice), endPrice, Number(params.spreadPct) || 0.01)
+        payout = gameResult.won ? Math.floor(betAmount * gameResult.multiplier) : 0
+        break
+      }
+      case 'futures': {
+        gameResult = futuresSettle(Number(params.entryPrice), endPrice, side, Number(params.leverage) || 10, betAmount)
+        payout = gameResult.payout
+        break
+      }
+      default:
+        return res.json({ success: false, error: `unknown game: ${game}` })
+    }
+
+    // Wallet: debit → credit
+    const debitRes = await walletDebit(tenant, playerId, betAmount, txId, `${game}_bet`)
+    if (!debitRes.success) return res.json({ success: false, error: debitRes.error })
+
+    if (payout > 0) {
+      await walletCredit(tenant, playerId, payout, `${txId}_win`, `${game}_win`)
+    }
+
+    updateTenantStats(tenant.id, betAmount, payout)
+    updateRTP(game, betAmount, payout)
+
+    return res.json({
+      success: true, game, result: payout > betAmount ? 'win' : payout > 0 ? 'partial' : 'lose',
+      payout, betAmount, endPrice, transactionId: txId, gameData: gameResult,
+    })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// ── B2B 게임 카탈로그
+app.get('/b2b/games/catalog', (req, res) => {
+  res.json({
+    success: true,
+    games: [
+      { id: 'crash', name: 'Crash', type: 'instant', rtp: 97, description: 'Rocket multiplier game' },
+      { id: 'dice', name: 'Dice', type: 'instant', rtp: 97, description: 'Over/Under dice roll' },
+      { id: 'mines', name: 'Mines', type: 'session', rtp: 97, description: 'Minesweeper with cashout' },
+      { id: 'plinko', name: 'Plinko', type: 'instant', rtp: 97, description: 'Pachinko ball drop' },
+      { id: 'updown', name: 'UP/DOWN', type: 'price', rtp: 97.5, description: '60s binary price prediction' },
+      { id: 'hilo', name: 'HI/LO', type: 'price', rtp: 97, description: '30s target price prediction' },
+      { id: 'spread', name: 'Spread', type: 'price', rtp: 95, description: '180s price range prediction' },
+      { id: 'futures', name: 'Futures', type: 'price', rtp: 94, description: 'Leveraged position trading' },
+      { id: 'holdem', name: "Texas Hold'em", type: 'pvp', rtp: 'N/A (rake 2.5-5%)', description: 'Real-time poker via WebSocket' },
+    ],
+  })
+})
+
+// ── B2B 정산 리포트
+app.get('/b2b/reports/:tenantId', b2bAuthMiddleware, (req, res) => {
+  const tenant = req.tenant
+  const share = tenant.revenueShare / 100
+  const ggr = tenant.stats.wagered - tenant.stats.paid
+  res.json({
+    success: true,
+    tenant: tenant.name,
+    stats: tenant.stats,
+    settlement: {
+      ggr,
+      ourShare: Math.floor(ggr * share),
+      tenantShare: Math.floor(ggr * (1 - share)),
+      revenueSharePct: tenant.revenueShare,
+    },
+  })
+})
+
+// ── B2B 테넌트별 RTP 설정
+app.post('/b2b/config/rtp', b2bAuthMiddleware, (req, res) => {
+  const { game, rtp } = req.body
+  const result = setTenantRTP(req.tenant.id, game, Number(rtp))
+  res.json({ success: true, rtpConfig: result })
+})
+
+// ── B2B 테넌트별 리깅 설정
+app.post('/b2b/config/rigging', b2bAuthMiddleware, (req, res) => {
+  const { game, enabled, threshold } = req.body
+  const result = setTenantRigging(req.tenant.id, game, enabled, threshold)
+  res.json({ success: true, riggingConfig: result })
+})
+
 // ═══════════════════════════════════════
 // 서버 시작
 // ═══════════════════════════════════════
@@ -564,7 +796,8 @@ app.listen(PORT, () => {
 ╔══════════════════════════════════════════╗
 ║  TETHER.BET Crypto Game Engine          ║
 ║  Port: ${PORT}                              ║
-║  Games: 8 (Provably Fair)               ║
+║  Games: 8 (Provably Fair) + Holdem      ║
+║  Mode: B2C + B2B API                    ║
 ║  Status: READY                           ║
 ╚══════════════════════════════════════════╝
   `)
