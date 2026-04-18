@@ -28,6 +28,55 @@ tenants.set('tether_bet_internal', {
   stats: { wagered: 0, paid: 0, ggr: 0, rounds: 0 },
 })
 
+// 샌드박스 테스트 업체 (누구나 테스트 가능)
+tenants.set('sandbox_demo', {
+  id: 'sandbox_demo',
+  name: 'Sandbox Demo',
+  apiKey: 'tb_sandbox_test_key_2026',
+  apiSecret: 'tb_sandbox_test_secret_2026',
+  walletUrl: null,  // Mock Wallet (서버 내장)
+  currency: 'USD',
+  allowedGames: ['crash','dice','mines','plinko','updown','hilo','spread','futures','holdem'],
+  rtpConfig: {},
+  riggingConfig: {},
+  revenueShare: 15,
+  status: 'active',
+  isSandbox: true,
+  stats: { wagered: 0, paid: 0, ggr: 0, rounds: 0 },
+})
+
+// 샌드박스 Mock Wallet (가상 잔액)
+const sandboxWallets = new Map()
+
+function getSandboxBalance(playerId) {
+  if (!sandboxWallets.has(playerId)) sandboxWallets.set(playerId, 10000)  // 기본 $10,000
+  return sandboxWallets.get(playerId)
+}
+
+function sandboxDebit(playerId, amount) {
+  const bal = getSandboxBalance(playerId)
+  if (bal < amount) return { success: false, error: 'insufficient_balance', balance: bal }
+  sandboxWallets.set(playerId, bal - amount)
+  return { success: true, balance: bal - amount }
+}
+
+function sandboxCredit(playerId, amount) {
+  const bal = getSandboxBalance(playerId)
+  sandboxWallets.set(playerId, bal + amount)
+  return { success: true, balance: bal + amount }
+}
+
+function sandboxRollback(playerId, amount) {
+  const bal = getSandboxBalance(playerId)
+  sandboxWallets.set(playerId, bal + amount)
+  return { success: true, balance: bal + amount }
+}
+
+function resetSandboxWallet(playerId) {
+  sandboxWallets.set(playerId, 10000)
+  return { success: true, balance: 10000 }
+}
+
 // ═══════════════════════════════════════
 // API Key 인증
 // ═══════════════════════════════════════
@@ -72,6 +121,7 @@ async function walletBalance(tenant, playerId) {
 }
 
 async function walletDebit(tenant, playerId, amount, transactionId, reason) {
+  if (tenant.isSandbox) return sandboxDebit(playerId, amount)
   if (!tenant.walletUrl) return { success: true, balance: 0 }  // 내부용 — B2C가 자체 처리
   try {
     const r = await fetch(`${tenant.walletUrl}/wallet/debit`, {
@@ -86,6 +136,7 @@ async function walletDebit(tenant, playerId, amount, transactionId, reason) {
 }
 
 async function walletCredit(tenant, playerId, amount, transactionId, reason) {
+  if (tenant.isSandbox) return sandboxCredit(playerId, amount)
   if (!tenant.walletUrl) return { success: true, balance: 0 }
   try {
     const r = await fetch(`${tenant.walletUrl}/wallet/credit`, {
@@ -100,6 +151,7 @@ async function walletCredit(tenant, playerId, amount, transactionId, reason) {
 }
 
 async function walletRollback(tenant, playerId, transactionId, reason) {
+  if (tenant.isSandbox) return { success: true }
   if (!tenant.walletUrl) return { success: true }
   try {
     const r = await fetch(`${tenant.walletUrl}/wallet/rollback`, {
@@ -170,4 +222,5 @@ module.exports = {
   walletBalance, walletDebit, walletCredit, walletRollback,
   registerTenant, getTenant, getAllTenants,
   updateTenantStats, setTenantRTP, setTenantRigging,
+  getSandboxBalance, resetSandboxWallet,
 }

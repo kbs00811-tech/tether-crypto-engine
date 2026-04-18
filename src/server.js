@@ -563,6 +563,7 @@ const {
   b2bAuthMiddleware, walletDebit, walletCredit, walletRollback,
   registerTenant, getAllTenants, updateTenantStats,
   setTenantRTP, setTenantRigging,
+  getSandboxBalance, resetSandboxWallet,
 } = require('./b2bAuth')
 const {
   addGameLog, getDailyReport, getMonthlyReport, getAllTimeReport,
@@ -924,6 +925,139 @@ app.get('/b2b/docs', (req, res) => {
       'Game results include seeds for player verification',
     ],
   })
+})
+
+// ═══════════════════════════════════════════════════
+// 샌드박스 — 테스트 환경
+// ═══════════════════════════════════════════════════
+
+// 잔액 조회/리셋
+app.get('/sandbox/balance/:playerId', (req, res) => {
+  res.json({ success: true, playerId: req.params.playerId, balance: getSandboxBalance(req.params.playerId) })
+})
+app.post('/sandbox/reset/:playerId', (req, res) => {
+  const r = resetSandboxWallet(req.params.playerId)
+  res.json({ success: true, playerId: req.params.playerId, balance: r.balance })
+})
+
+// 샌드박스 데모 페이지
+app.get('/sandbox', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TETHER.BET Game Engine — Sandbox</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0B0E14;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+h1{color:#2EBD85;margin-bottom:5px}
+.sub{color:#666;font-size:13px;margin-bottom:30px}
+.card{background:#141720;border:1px solid #1e2230;border-radius:16px;padding:20px;margin-bottom:16px}
+.card h3{color:#2EBD85;font-size:14px;margin-bottom:12px}
+.row{display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+select,input,button{background:#1a1e2e;border:1px solid #2a2e3e;border-radius:8px;color:#fff;padding:8px 14px;font-size:13px;outline:none}
+select:focus,input:focus{border-color:#2EBD85}
+button{background:#2EBD85;color:#000;font-weight:700;cursor:pointer;border:none}
+button:hover{background:#26A17B}
+button.red{background:#F6465D}
+button.blue{background:#06B6D4}
+.result{background:#0d1017;border:1px solid #1e2230;border-radius:8px;padding:12px;margin-top:10px;font-family:monospace;font-size:12px;white-space:pre-wrap;max-height:300px;overflow:auto}
+.badge{display:inline-block;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:700}
+.badge.win{background:#2EBD8520;color:#2EBD85}
+.badge.lose{background:#F6465D20;color:#F6465D}
+.balance{font-size:24px;font-weight:800;color:#2EBD85;font-family:'Space Grotesk',monospace}
+.info{color:#666;font-size:11px;margin-top:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+</style>
+</head>
+<body>
+<h1>TETHER.BET Game Engine</h1>
+<p class="sub">Sandbox Testing Environment — API Key: <code style="color:#F0B90B">tb_sandbox_test_key_2026</code></p>
+
+<div class="card">
+<h3>Player Balance</h3>
+<div class="row">
+<input id="pid" value="test_player_1" placeholder="Player ID" style="flex:1">
+<button onclick="checkBalance()">Check</button>
+<button class="red" onclick="resetBalance()">Reset $10,000</button>
+</div>
+<div class="balance" id="bal">$10,000.00</div>
+</div>
+
+<div class="card">
+<h3>Play Game</h3>
+<div class="row">
+<select id="game">
+<option value="crash">Crash</option>
+<option value="dice">Dice</option>
+<option value="plinko">Plinko</option>
+</select>
+<input id="amount" type="number" value="100" placeholder="Bet Amount" style="width:100px">
+</div>
+<div class="row">
+<input id="cashoutAt" value="2.0" placeholder="Crash: cashout at" style="width:120px">
+<input id="target" value="50" placeholder="Dice: target" style="width:100px">
+<select id="direction"><option value="over">Over</option><option value="under">Under</option></select>
+<select id="risk"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option></select>
+</div>
+<button onclick="playGame()">PLAY</button>
+<div class="result" id="result">Result will appear here...</div>
+</div>
+
+<div class="card">
+<h3>Game Catalog</h3>
+<div id="catalog" class="grid"></div>
+</div>
+
+<div class="card">
+<h3>API Documentation</h3>
+<button class="blue" onclick="window.open('/b2b/docs','_blank')">View Full API Docs (JSON)</button>
+<p class="info">Base URL: <code>${'https://tether-crypto-engine-production.up.railway.app'}</code></p>
+</div>
+
+<script>
+const API='';
+const KEY='tb_sandbox_test_key_2026';
+const h={'Content-Type':'application/json','X-API-Key':KEY};
+
+async function checkBalance(){
+  const pid=document.getElementById('pid').value;
+  const r=await fetch(API+'/sandbox/balance/'+pid).then(r=>r.json());
+  document.getElementById('bal').textContent='$'+r.balance.toLocaleString('en-US',{minimumFractionDigits:2});
+}
+
+async function resetBalance(){
+  const pid=document.getElementById('pid').value;
+  await fetch(API+'/sandbox/reset/'+pid,{method:'POST'});
+  checkBalance();
+}
+
+async function playGame(){
+  const game=document.getElementById('game').value;
+  const pid=document.getElementById('pid').value;
+  const amount=Number(document.getElementById('amount').value);
+  const params={};
+  if(game==='crash')params.cashoutAt=Number(document.getElementById('cashoutAt').value);
+  if(game==='dice'){params.target=Number(document.getElementById('target').value);params.direction=document.getElementById('direction').value}
+  if(game==='plinko')params.risk=document.getElementById('risk').value;
+
+  const r=await fetch(API+'/b2b/game/play',{method:'POST',headers:h,body:JSON.stringify({game,playerId:pid,amount,params})}).then(r=>r.json());
+
+  const el=document.getElementById('result');
+  el.innerHTML='<span class="badge '+(r.result==='win'?'win':'lose')+'">'+r.result?.toUpperCase()+'</span>\\n\\n'+JSON.stringify(r,null,2);
+  checkBalance();
+}
+
+// Load catalog
+fetch(API+'/b2b/games/catalog').then(r=>r.json()).then(d=>{
+  const el=document.getElementById('catalog');
+  el.innerHTML=d.games.map(g=>'<div style="background:#0d1017;border:1px solid #1e2230;border-radius:8px;padding:10px"><div style="font-weight:700;color:#2EBD85">'+g.name+'</div><div style="font-size:11px;color:#888;margin-top:4px">'+g.description+'</div><div style="font-size:11px;color:#F0B90B;margin-top:4px">RTP: '+g.rtp+' | Type: '+g.type+'</div></div>').join('');
+});
+
+checkBalance();
+</script>
+</body>
+</html>`)
 })
 
 // ═══════════════════════════════════════
