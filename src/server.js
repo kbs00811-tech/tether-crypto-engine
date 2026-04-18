@@ -564,6 +564,10 @@ const {
   registerTenant, getAllTenants, updateTenantStats,
   setTenantRTP, setTenantRigging,
 } = require('./b2bAuth')
+const {
+  addGameLog, getDailyReport, getMonthlyReport, getAllTimeReport,
+  getTopPlayers, generateCSV, getLogsForExport,
+} = require('./settlement')
 
 // ── 업체 등록 (마스터 어드민만)
 app.post('/b2b/auth/register', (req, res) => {
@@ -653,6 +657,7 @@ app.post('/b2b/game/play', b2bAuthMiddleware, async (req, res) => {
 
     // 4. 통계 업데이트
     updateTenantStats(tenant.id, betAmount, payout)
+    addGameLog(tenant.id, playerId, game, betAmount, payout, payout > betAmount ? 'win' : 'lose', txId)
     updateRTP(game, betAmount, payout)
 
     return res.json({
@@ -727,6 +732,7 @@ app.post('/b2b/game/settle', b2bAuthMiddleware, async (req, res) => {
     }
 
     updateTenantStats(tenant.id, betAmount, payout)
+    addGameLog(tenant.id, playerId, game, betAmount, payout, payout > betAmount ? 'win' : 'lose', txId)
     updateRTP(game, betAmount, payout)
 
     return res.json({
@@ -786,6 +792,138 @@ app.post('/b2b/config/rigging', b2bAuthMiddleware, (req, res) => {
   const { game, enabled, threshold } = req.body
   const result = setTenantRigging(req.tenant.id, game, enabled, threshold)
   res.json({ success: true, riggingConfig: result })
+})
+
+// ═══════════════════════════════════════════════════
+// B2B 정산 리포트
+// ═══════════════════════════════════════════════════
+
+// 일일 정산
+app.get('/b2b/reports/daily', b2bAuthMiddleware, (req, res) => {
+  const date = req.query.date || new Date().toISOString().split('T')[0]
+  const report = getDailyReport(req.tenant.id, date)
+  const share = req.tenant.revenueShare / 100
+  res.json({
+    success: true, tenant: req.tenant.name, ...report,
+    settlement: { ourShare: Math.floor(report.ggr * share), tenantShare: Math.floor(report.ggr * (1 - share)), pct: req.tenant.revenueShare },
+  })
+})
+
+// 월간 정산
+app.get('/b2b/reports/monthly', b2bAuthMiddleware, (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7)
+  const report = getMonthlyReport(req.tenant.id, month)
+  const share = req.tenant.revenueShare / 100
+  res.json({
+    success: true, tenant: req.tenant.name, ...report,
+    settlement: { ourShare: Math.floor(report.ggr * share), tenantShare: Math.floor(report.ggr * (1 - share)), pct: req.tenant.revenueShare },
+  })
+})
+
+// 전체 정산
+app.get('/b2b/reports/all', b2bAuthMiddleware, (req, res) => {
+  const report = getAllTimeReport(req.tenant.id)
+  const share = req.tenant.revenueShare / 100
+  res.json({
+    success: true, tenant: req.tenant.name, ...report,
+    settlement: { ourShare: Math.floor(report.ggr * share), tenantShare: Math.floor(report.ggr * (1 - share)), pct: req.tenant.revenueShare },
+  })
+})
+
+// 상위 플레이어
+app.get('/b2b/reports/top-players', b2bAuthMiddleware, (req, res) => {
+  const limit = Number(req.query.limit) || 20
+  res.json({ success: true, players: getTopPlayers(req.tenant.id, limit) })
+})
+
+// CSV 다운로드
+app.get('/b2b/reports/export', b2bAuthMiddleware, (req, res) => {
+  const logs = getLogsForExport(req.tenant.id, req.query.from, req.query.to)
+  const csv = generateCSV(logs)
+  res.setHeader('Content-Type', 'text/csv')
+  res.setHeader('Content-Disposition', `attachment; filename="${req.tenant.name}_${req.query.from || 'all'}_${req.query.to || 'now'}.csv"`)
+  res.send(csv)
+})
+
+// ═══════════════════════════════════════════════════
+// API 문서 — 자동 생성
+// ═══════════════════════════════════════════════════
+app.get('/b2b/docs', (req, res) => {
+  res.json({
+    name: 'TETHER.BET Game Engine API',
+    version: '1.0.0',
+    baseUrl: 'https://tether-crypto-engine-production.up.railway.app',
+    authentication: {
+      method: 'API Key',
+      header: 'X-API-Key',
+      description: 'Contact us to get your API key',
+    },
+    endpoints: {
+      'Authentication': {
+        'POST /b2b/auth/register': { body: { masterKey: 'string', name: 'string', walletUrl: 'string', currency: 'USD', revenueShare: 15 }, description: 'Register new operator (master admin only)' },
+      },
+      'Game Catalog': {
+        'GET /b2b/games/catalog': { description: 'List all available games with RTP and type info' },
+      },
+      'Instant Games (Crash, Dice, Plinko)': {
+        'POST /b2b/game/play': {
+          headers: { 'X-API-Key': 'your_api_key' },
+          body: { game: 'crash|dice|plinko', playerId: 'string', amount: 'number', params: { cashoutAt: 2.0, target: 50, direction: 'over', risk: 'medium', clientSeed: 'string' } },
+          response: { success: true, result: 'win|lose', payout: 195, multiplier: 1.95, gameData: {}, seed: { serverSeed: '...', serverSeedHash: '...' } },
+          description: 'Play instant game. Wallet debit/credit handled automatically via Seamless Wallet.',
+        },
+      },
+      'Session Games (Mines)': {
+        'POST /b2b/game/mines/start': { body: { playerId: 'string', amount: 'number', params: { mines: 3 } }, description: 'Start Mines game, returns sessionId' },
+        'POST /b2b/game/mines/reveal': { body: { sessionId: 'string', tileIndex: 'number (0-24)' }, description: 'Reveal a tile' },
+        'POST /b2b/game/mines/cashout': { body: { sessionId: 'string' }, description: 'Cash out current multiplier' },
+      },
+      'Price Games (UP/DOWN, HI/LO, Spread, Futures)': {
+        'POST /b2b/game/settle': {
+          body: { game: 'updown|hilo|spread|futures', playerId: 'string', amount: 'number', params: { side: 'UP|DOWN|HIGHER|LOWER|LONG|SHORT', startPrice: 'number', coin: 'BTCUSDT' } },
+          description: 'Settle price-based game after round ends. Uses live Binance price.',
+        },
+      },
+      'Provably Fair': {
+        'POST /api/game/verify': { body: { game: 'string', serverSeed: 'string', clientSeed: 'string', nonce: 'number' }, description: 'Verify game result with seeds' },
+      },
+      'Reports': {
+        'GET /b2b/reports/daily?date=2026-04-18': { description: 'Daily settlement report with GGR breakdown' },
+        'GET /b2b/reports/monthly?month=2026-04': { description: 'Monthly settlement report' },
+        'GET /b2b/reports/all': { description: 'All-time report' },
+        'GET /b2b/reports/top-players?limit=20': { description: 'Top players by wagered amount' },
+        'GET /b2b/reports/export?from=2026-04-01&to=2026-04-18': { description: 'CSV export of game logs' },
+      },
+      'Configuration': {
+        'POST /b2b/config/rtp': { body: { game: 'crash', rtp: 95 }, description: 'Set RTP for specific game (per-tenant)' },
+        'POST /b2b/config/rigging': { body: { game: 'updown', enabled: true, threshold: 60 }, description: 'Configure balance rigging (per-tenant)' },
+      },
+      'Seamless Wallet (Operator implements)': {
+        'POST {your_wallet_url}/wallet/balance': { body: { playerId: 'string' }, response: { success: true, balance: 1000 }, description: 'We call this to check player balance' },
+        'POST {your_wallet_url}/wallet/debit': { body: { playerId: 'string', amount: 100, transactionId: 'string', reason: 'string' }, response: { success: true, balance: 900 }, description: 'We call this to deduct bet amount' },
+        'POST {your_wallet_url}/wallet/credit': { body: { playerId: 'string', amount: 195, transactionId: 'string', reason: 'string' }, response: { success: true, balance: 1095 }, description: 'We call this to pay winnings' },
+        'POST {your_wallet_url}/wallet/rollback': { body: { playerId: 'string', transactionId: 'string', reason: 'string' }, response: { success: true }, description: 'We call this to reverse a failed transaction' },
+      },
+    },
+    games: {
+      crash: { rtp: '97%', type: 'instant', description: 'Rocket multiplier — cash out before crash' },
+      dice: { rtp: '97%', type: 'instant', description: 'Roll over/under target number' },
+      mines: { rtp: '97%', type: 'session', description: 'Minesweeper — reveal gems, avoid mines' },
+      plinko: { rtp: '97%', type: 'instant', description: 'Drop ball through pins to win multiplier' },
+      updown: { rtp: '97.5%', type: 'price', duration: '60s', description: 'Predict if price goes UP or DOWN' },
+      hilo: { rtp: '97%', type: 'price', duration: '30s', description: 'Predict if price goes HIGHER or LOWER than target' },
+      spread: { rtp: '95%', type: 'price', duration: '180s', description: 'Predict if price stays within range' },
+      futures: { rtp: '94%', type: 'price', description: 'Leveraged long/short position trading' },
+      holdem: { rtp: 'N/A (rake)', type: 'pvp', description: 'Texas Hold\'em Poker via WebSocket (separate engine)' },
+    },
+    notes: [
+      'All instant games use HMAC-SHA256 Provably Fair system',
+      'Price games use live Binance API for settlement',
+      'Wallet operations are synchronous — respond within 5 seconds',
+      'All amounts are in cents (integer) to avoid floating point issues',
+      'Game results include seeds for player verification',
+    ],
+  })
 })
 
 // ═══════════════════════════════════════
