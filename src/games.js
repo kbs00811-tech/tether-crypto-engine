@@ -42,11 +42,7 @@ function getAllRTP() {
   return result
 }
 
-module.exports.houseEdgeConfig = houseEdgeConfig
-module.exports.getHouseEdge = getHouseEdge
-module.exports.getRTP = getRTP
-module.exports.setHouseEdge = setHouseEdge
-module.exports.getAllRTP = getAllRTP
+// (exports는 파일 하단 module.exports에 통합)
 
 // ═══════════════════════════════════════
 // 1. CRASH — 로켓 배수 게임
@@ -232,4 +228,5 @@ module.exports = {
   crash, dice, mines, minesMultiplier, plinko,
   updownSettle, hiloSettle, spreadSettle,
   futuresSettle, futuresLiquidationPrice,
+  houseEdgeConfig, getHouseEdge, getRTP, setHouseEdge, getAllRTP,
 }
