@@ -1,22 +1,68 @@
 /**
  * 8개 크립토 게임 — 서버 사이드 로직
  * 모든 결과는 Provably Fair 해시에서 결정
+ * 환수율(RTP)은 houseEdge 설정으로 동적 조정 가능
  */
 const { hashToFloat, hashToInt } = require('./provablyFair')
 
 // ═══════════════════════════════════════
+// 환수율 설정 (어드민 API로 변경 가능)
+// houseEdge = 1 - RTP (예: 0.03 = 97% RTP)
+// ═══════════════════════════════════════
+const houseEdgeConfig = {
+  crash:   0.03,   // RTP 97%
+  dice:    0.03,   // RTP 97%
+  mines:   0.03,   // RTP 97%
+  plinko:  0.03,   // RTP 97%
+  updown:  0.025,  // RTP 97.5%
+  hilo:    0.03,   // RTP 97%
+  spread:  0.05,   // RTP 95%
+  futures: 0.06,   // RTP 94%
+}
+
+function getHouseEdge(game) {
+  return houseEdgeConfig[game] ?? 0.03
+}
+
+function getRTP(game) {
+  return parseFloat(((1 - getHouseEdge(game)) * 100).toFixed(2))
+}
+
+function setHouseEdge(game, edge) {
+  if (edge < 0.005 || edge > 0.20) return false  // 0.5%~20% 범위
+  houseEdgeConfig[game] = edge
+  return true
+}
+
+function getAllRTP() {
+  const result = {}
+  for (const [game, edge] of Object.entries(houseEdgeConfig)) {
+    result[game] = { houseEdge: edge, rtp: parseFloat(((1 - edge) * 100).toFixed(2)) }
+  }
+  return result
+}
+
+module.exports.houseEdgeConfig = houseEdgeConfig
+module.exports.getHouseEdge = getHouseEdge
+module.exports.getRTP = getRTP
+module.exports.setHouseEdge = setHouseEdge
+module.exports.getAllRTP = getAllRTP
+
+// ═══════════════════════════════════════
 // 1. CRASH — 로켓 배수 게임
 // ═══════════════════════════════════════
-// RTP: 97% (h%33===0 → 즉사 = 3.03% 하우스 엣지)
+// Crash — 하우스 엣지 동적 적용
 function crash(hash) {
   const h = parseInt(hash.slice(0, 13), 16)
   const e = Math.pow(2, 52)
+  const edge = getHouseEdge('crash')
 
-  // 3.03% 즉사
-  if (h % 33 === 0) return { crashPoint: 1.00 }
+  // 즉사 확률 = 하우스 엣지 (예: 3% → h%33===0)
+  const instantCrashMod = Math.max(2, Math.round(1 / edge))
+  if (h % instantCrashMod === 0) return { crashPoint: 1.00 }
 
-  const crashPoint = Math.floor((100 * e) / (e - h)) / 100
-  return { crashPoint: Math.min(crashPoint, 100000) }
+  const crashPoint = Math.floor((100 * e * (1 - edge)) / (e - h)) / 100
+  return { crashPoint: Math.min(Math.max(1.01, crashPoint), 100000) }
 }
 
 // ═══════════════════════════════════════
@@ -30,7 +76,8 @@ function dice(hash, params) {
 
   const won = isOver ? (roll > target) : (roll < target)
   const winChance = isOver ? (100 - target) : target
-  const multiplier = won ? parseFloat((97 / winChance).toFixed(4)) : 0
+  const rtp = 100 - (getHouseEdge('dice') * 100)
+  const multiplier = won ? parseFloat((rtp / winChance).toFixed(4)) : 0
 
   return { roll, target, direction: params.direction, won, multiplier, winChance }
 }
@@ -60,7 +107,7 @@ function minesMultiplier(mineCount, revealedCount) {
   for (let i = 0; i < revealedCount; i++) {
     mult *= (25 - mineCount - i) > 0 ? (25 - i) / (25 - mineCount - i) : 1
   }
-  return parseFloat((mult * 0.97).toFixed(4))
+  return parseFloat((mult * (1 - getHouseEdge('mines'))).toFixed(4))
 }
 
 // ═══════════════════════════════════════
@@ -104,7 +151,8 @@ function updownSettle(startPrice, endPrice, side) {
   // 동가 → 무승부 (환불)
   if (endPrice === startPrice) return { won: false, tie: true, multiplier: 1.0 }
 
-  return { won, tie: false, multiplier: won ? 1.95 : 0 }
+  const payout = parseFloat((2 * (1 - getHouseEdge('updown'))).toFixed(4))  // ~1.95
+  return { won, tie: false, multiplier: won ? payout : 0 }
 }
 
 // ═══════════════════════════════════════
@@ -117,7 +165,8 @@ function hiloSettle(targetPrice, endPrice, side) {
   if (side === 'LOWER' && endPrice < targetPrice) won = true
   if (endPrice === targetPrice) return { won: false, tie: true, multiplier: 1.0 }
 
-  return { won, tie: false, multiplier: won ? 1.97 : 0 }
+  const payout = parseFloat((2 * (1 - getHouseEdge('hilo'))).toFixed(4))  // ~1.94
+  return { won, tie: false, multiplier: won ? payout : 0 }
 }
 
 // ═══════════════════════════════════════

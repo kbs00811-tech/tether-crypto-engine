@@ -19,6 +19,7 @@ const {
   crash, dice, mines, minesMultiplier, plinko,
   updownSettle, hiloSettle, spreadSettle,
   futuresSettle, futuresLiquidationPrice,
+  getAllRTP, setHouseEdge, getRTP,
 } = require('./games')
 
 const app = express()
@@ -376,18 +377,96 @@ app.post('/api/game/verify', (req, res) => {
 })
 
 // ═══════════════════════════════════════
-// GET /api/game/rtp — RTP 통계
+// GET /api/game/rtp — RTP 통계 + 현재 설정
 // ═══════════════════════════════════════
 app.get('/api/game/rtp', (req, res) => {
+  const config = getAllRTP()
   const stats = {}
   for (const [game, s] of Object.entries(rtpStats)) {
     stats[game] = {
       ...s,
       currentRTP: s.wagered > 0 ? parseFloat((s.paid / s.wagered * 100).toFixed(2)) : 0,
-      targetRTP: { crash: 97, dice: 97, mines: 97, plinko: 97, updown: 97.5, hilo: 97, spread: 95, futures: 94 }[game],
+      targetRTP: config[game]?.rtp || 97,
+      houseEdge: config[game]?.houseEdge || 0.03,
     }
   }
-  res.json({ success: true, stats })
+  res.json({ success: true, stats, config })
+})
+
+// ═══════════════════════════════════════
+// POST /api/game/rtp/set — 환수율 설정 (어드민)
+// ═══════════════════════════════════════
+app.post('/api/game/rtp/set', (req, res) => {
+  try {
+    const { game, rtp, apiKey } = req.body
+
+    // 간단 인증 (프로덕션에서는 JWT로 교체)
+    const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
+    if (apiKey !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, error: 'unauthorized' })
+    }
+
+    if (!game) {
+      return res.json({ success: false, error: 'game required' })
+    }
+
+    const rtpValue = Number(rtp)
+    if (rtpValue < 80 || rtpValue > 99.5) {
+      return res.json({ success: false, error: 'RTP must be 80~99.5%' })
+    }
+
+    const houseEdge = parseFloat(((100 - rtpValue) / 100).toFixed(4))
+    const ok = setHouseEdge(game, houseEdge)
+
+    if (!ok) return res.json({ success: false, error: 'invalid value' })
+
+    console.log(`[Admin] RTP changed: ${game} → ${rtpValue}% (edge: ${houseEdge})`)
+
+    return res.json({
+      success: true,
+      game,
+      newRTP: rtpValue,
+      houseEdge,
+      allConfig: getAllRTP(),
+    })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// ═══════════════════════════════════════
+// POST /api/game/rtp/batch — 전체 환수율 일괄 설정
+// ═══════════════════════════════════════
+app.post('/api/game/rtp/batch', (req, res) => {
+  try {
+    const { settings, apiKey } = req.body
+
+    const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
+    if (apiKey !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, error: 'unauthorized' })
+    }
+
+    if (!settings || typeof settings !== 'object') {
+      return res.json({ success: false, error: 'settings object required' })
+    }
+
+    const results = {}
+    for (const [game, rtpValue] of Object.entries(settings)) {
+      const rtp = Number(rtpValue)
+      if (rtp >= 80 && rtp <= 99.5) {
+        const edge = parseFloat(((100 - rtp) / 100).toFixed(4))
+        setHouseEdge(game, edge)
+        results[game] = { rtp, houseEdge: edge, status: 'ok' }
+      } else {
+        results[game] = { rtp, status: 'invalid (80~99.5)' }
+      }
+    }
+
+    console.log('[Admin] Batch RTP update:', results)
+    return res.json({ success: true, results, allConfig: getAllRTP() })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
 })
 
 // ═══════════════════════════════════════
