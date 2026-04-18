@@ -928,6 +928,48 @@ app.get('/b2b/docs', (req, res) => {
 })
 
 // ═══════════════════════════════════════════════════
+// iframe Widget — B2B 업체용 게임 임베딩
+// ═══════════════════════════════════════════════════
+const { generateWidgetHTML, generateWidgetLauncher } = require('./widget')
+
+// 게임 런처 (전체 게임 선택 화면)
+app.get('/widget', (req, res) => {
+  res.send(generateWidgetLauncher(req.query))
+})
+
+// 개별 게임 위젯
+app.get('/widget/:game', (req, res) => {
+  const html = generateWidgetHTML(req.params.game, req.query)
+  res.send(html)
+})
+
+// B2B 게임 런칭 URL 생성 API
+app.post('/b2b/game/launch', b2bAuthMiddleware, (req, res) => {
+  const { game, playerId, currency, theme, locale } = req.body
+  const tenant = req.tenant
+  if (!game || !playerId) return res.json({ success: false, error: 'game and playerId required' })
+
+  const baseUrl = `https://tether-crypto-engine-production.up.railway.app`
+  const params = new URLSearchParams({
+    apiKey: tenant.apiKey,
+    playerId,
+    currency: currency || tenant.currency || 'USD',
+    theme: theme || 'dark',
+    locale: locale || 'en',
+  })
+
+  const url = `${baseUrl}/widget/${game}?${params}`
+  const launcherUrl = `${baseUrl}/widget?${params}`
+
+  res.json({
+    success: true,
+    gameUrl: url,
+    launcherUrl,
+    iframe: `<iframe src="${url}" width="100%" height="600" frameborder="0" allow="autoplay"></iframe>`,
+  })
+})
+
+// ═══════════════════════════════════════════════════
 // 샌드박스 — 테스트 환경
 // ═══════════════════════════════════════════════════
 
