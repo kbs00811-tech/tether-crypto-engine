@@ -548,6 +548,36 @@ app.post('/api/game/rtp/batch', (req, res) => {
 })
 
 // ═══════════════════════════════════════
+// 유저별 RTP 조정 (서버 저장)
+// ═══════════════════════════════════════
+const userRtpConfig = {}
+
+app.get('/api/game/user-rtp', (req, res) => {
+  const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
+  if (req.query.apiKey !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'unauthorized' })
+  res.json({ success: true, config: userRtpConfig })
+})
+
+app.post('/api/game/user-rtp/set', (req, res) => {
+  const { usercode, adjustments, apiKey } = req.body
+  const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
+  if (apiKey !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'unauthorized' })
+  if (!usercode) return res.json({ success: false, error: 'usercode required' })
+
+  userRtpConfig[usercode] = adjustments || {}
+  console.log(`[Admin] User RTP set: ${usercode}`, adjustments)
+  res.json({ success: true, usercode, adjustments: userRtpConfig[usercode], allUsers: Object.keys(userRtpConfig) })
+})
+
+app.post('/api/game/user-rtp/delete', (req, res) => {
+  const { usercode, apiKey } = req.body
+  const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
+  if (apiKey !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'unauthorized' })
+  delete userRtpConfig[usercode]
+  res.json({ success: true, deleted: usercode })
+})
+
+// ═══════════════════════════════════════
 // Binance 가격 조회 (프론트용)
 // ═══════════════════════════════════════
 app.get('/api/price/:symbol', async (req, res) => {
