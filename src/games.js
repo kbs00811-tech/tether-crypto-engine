@@ -188,15 +188,15 @@ function spreadSettle(startPrice, endPrice, spreadPct) {
 // ═══════════════════════════════════════
 // RTP: ~94% (수수료 + 스프레드)
 function futuresSettle(entryPrice, exitPrice, side, leverage, amount) {
-  const fee = 0.001  // 0.1% 수수료
+  const fee = 0.00025  // 0.025% 수수료 (바이낸스 동일)
   const diff = exitPrice - entryPrice
   const pctChange = diff / entryPrice
   const leveragedPct = side === 'LONG' ? pctChange * leverage : -pctChange * leverage
 
-  // 청산 체크 (90% 손실)
-  const isLiquidated = leveragedPct <= -0.9
+  // 청산 체크 (100% 손실 — 바이낸스 동일)
+  const isLiquidated = leveragedPct <= -1.0
 
-  const grossPnl = isLiquidated ? -amount * 0.9 : amount * leveragedPct
+  const grossPnl = isLiquidated ? -amount : amount * leveragedPct
   const feeAmount = amount * fee * 2  // 진입 + 청산
   const netPnl = grossPnl - feeAmount
 
@@ -218,7 +218,7 @@ function futuresSettle(entryPrice, exitPrice, side, leverage, amount) {
 
 // 청산가 계산
 function futuresLiquidationPrice(entryPrice, side, leverage) {
-  const pct = 0.9 / leverage
+  const pct = 1.0 / leverage
   return side === 'LONG'
     ? parseFloat((entryPrice * (1 - pct)).toFixed(2))
     : parseFloat((entryPrice * (1 + pct)).toFixed(2))
