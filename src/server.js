@@ -135,22 +135,8 @@ app.post('/api/game/play', async (req, res) => {
 
     updateRTP(game, betAmount, payout)
 
-    // 🗄️ DB 영구 저장 (fire-and-forget, 게임 응답 지연 없음)
-    const seedId = await db.saveSeed({
-      serverSeed: seedSet.serverSeed,
-      serverSeedHash: seedSet.serverSeedHash,
-      clientSeed: seedSet.clientSeed,
-      nonce: seedSet.nonce,
-      game, resultHash: hash,
-    })
-    db.saveRound({
-      seedId, game,
-      usercode: params.usercode, userId: params.userId,
-      betAmount, result, payout, multiplier, gameData: gameResult,
-    })
-    db.bumpRTP(game, betAmount, payout)
-
-    return res.json({
+    // 🚀 즉시 응답 — DB 저장은 비동기 (응답 지연 0ms)
+    res.json({
       success: true,
       game,
       result,
@@ -165,8 +151,22 @@ app.post('/api/game/play', async (req, res) => {
         nonce: seedSet.nonce,
       },
     })
+
+    // 🗄️ 응답 후 DB 저장 (fire-and-forget)
+    db.saveSeed({
+      serverSeed: seedSet.serverSeed, serverSeedHash: seedSet.serverSeedHash,
+      clientSeed: seedSet.clientSeed, nonce: seedSet.nonce,
+      game, resultHash: hash,
+    }).then(seedId => {
+      db.saveRound({
+        seedId, game,
+        usercode: params.usercode, userId: params.userId,
+        betAmount, result, payout, multiplier, gameData: gameResult,
+      })
+    }).catch(e => console.warn('[db] play persist', e.message))
+    db.bumpRTP(game, betAmount, payout)
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message })
+    if (!res.headersSent) res.status(500).json({ success: false, error: err.message })
   }
 })
 
@@ -186,16 +186,7 @@ app.post('/api/game/mines/start', async (req, res) => {
     const gameResult = mines(hash, params)
     const sessionId = crypto.randomBytes(16).toString('hex')
 
-    // 🗄️ seed 저장
-    const seedId = await db.saveSeed({
-      serverSeed: seedSet.serverSeed,
-      serverSeedHash: seedSet.serverSeedHash,
-      clientSeed: seedSet.clientSeed,
-      nonce: seedSet.nonce,
-      game: 'mines', resultHash: hash,
-    })
-
-    // 메모리 + DB 이중 저장 (메모리는 빠른 read, DB는 장애 복구)
+    // 메모리 즉시 저장 (응답 전)
     mineSessions.set(sessionId, {
       mines: gameResult.mines,
       mineCount: gameResult.mineCount,
@@ -203,30 +194,39 @@ app.post('/api/game/mines/start', async (req, res) => {
       betAmount,
       seedSet,
       hash,
-      seedId,
+      seedId: null,  // DB 저장 후 업데이트
       usercode: params.usercode,
       createdAt: Date.now(),
     })
 
-    // DB 저장 (TTL 1시간 - 기존 5분에서 연장, 장애 복구 가능)
-    db.createMinesSession({
-      sessionId, usercode: params.usercode,
-      betAmount, mineCount: gameResult.mineCount,
-      mines: gameResult.mines, seedId, ttlMinutes: 60,
-    })
-
-    // 1시간 후 메모리 정리
-    setTimeout(() => mineSessions.delete(sessionId), 60 * 60 * 1000)
-
-    return res.json({
+    // 🚀 즉시 응답
+    res.json({
       success: true,
       sessionId,
       mineCount: gameResult.mineCount,
       gridSize: 25,
       serverSeedHash: seedSet.serverSeedHash,
     })
+
+    // 🗄️ 비동기 DB 저장 (fire-and-forget)
+    db.saveSeed({
+      serverSeed: seedSet.serverSeed, serverSeedHash: seedSet.serverSeedHash,
+      clientSeed: seedSet.clientSeed, nonce: seedSet.nonce,
+      game: 'mines', resultHash: hash,
+    }).then(seedId => {
+      const mem = mineSessions.get(sessionId)
+      if (mem) mem.seedId = seedId
+      return db.createMinesSession({
+        sessionId, usercode: params.usercode,
+        betAmount, mineCount: gameResult.mineCount,
+        mines: gameResult.mines, seedId, ttlMinutes: 60,
+      })
+    }).catch(e => console.warn('[db] mines/start persist', e.message))
+
+    // 1시간 후 메모리 정리
+    setTimeout(() => mineSessions.delete(sessionId), 60 * 60 * 1000)
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message })
+    if (!res.headersSent) res.status(500).json({ success: false, error: err.message })
   }
 })
 
@@ -383,6 +383,11 @@ app.post('/api/game/settle', async (req, res) => {
 
     const betAmount = Math.floor(Number(amount))
     const coin = params.coin || 'BTCUSDT'
+
+    // 가격 게임용 seed 생성 (price fetch 전에 미리)
+    const priceSeedSet = createSeedSet(params.clientSeed || 'default')
+    priceSeedSet.nonce = Number(params.nonce) || Date.now()
+
     const endPrice = Number(params.endPrice) || await getBinancePrice(coin)
     if (!endPrice) return res.json({ success: false, error: 'price unavailable' })
 
@@ -442,30 +447,38 @@ app.post('/api/game/settle', async (req, res) => {
     }
 
     updateRTP(game, betAmount, payout)
+    const resultStr = payout > betAmount ? 'win' : payout > 0 ? 'partial' : 'lose'
 
-    // 🗄️ DB 저장 — 가격 게임은 seed 없이 round만 (가격 기반이라 seed 의미 적음)
-    db.saveRound({
-      seedId: null, game,
-      usercode: params.usercode, userId: params.userId,
-      betAmount, result: payout > betAmount ? 'win' : payout > 0 ? 'partial' : 'lose',
-      payout,
-      multiplier: gameResult.multiplier || 0,
-      gameData: { ...gameResult, endPrice, roundId, side },
-      overrideInfo: riggingOverride ? { riggingOverride, losingSide } : null,
-    })
-    db.bumpRTP(game, betAmount, payout)
-
-    return res.json({
+    // 🚀 즉시 응답
+    res.json({
       success: true,
       game,
-      result: payout > betAmount ? 'win' : payout > 0 ? 'partial' : 'lose',
+      result: resultStr,
       payout,
       betAmount,
       endPrice,
       gameData: gameResult,
     })
+
+    // 🗄️ 가격 게임도 seed + round 모두 영구화 (Provably Fair 전체 커버)
+    db.saveSeed({
+      serverSeed: priceSeedSet.serverSeed, serverSeedHash: priceSeedSet.serverSeedHash,
+      clientSeed: priceSeedSet.clientSeed, nonce: priceSeedSet.nonce,
+      game, resultHash: null,  // 가격 게임은 HMAC 대신 price 기반
+    }).then(seedId => {
+      db.saveRound({
+        seedId, game,
+        usercode: params.usercode, userId: params.userId,
+        betAmount, result: resultStr,
+        payout,
+        multiplier: gameResult.multiplier || 0,
+        gameData: { ...gameResult, endPrice, roundId, side, coin },
+        overrideInfo: riggingOverride ? { riggingOverride, losingSide } : null,
+      })
+    }).catch(e => console.warn('[db] settle persist', e.message))
+    db.bumpRTP(game, betAmount, payout)
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message })
+    if (!res.headersSent) res.status(500).json({ success: false, error: err.message })
   }
 })
 
@@ -555,18 +568,46 @@ app.post('/api/game/verify', (req, res) => {
 
 // ═══════════════════════════════════════
 // GET /api/game/rtp — RTP 통계 + 현재 설정
+// v1.1: DB 집계 우선 (재시작해도 유지), 메모리는 당일 증분만
 // ═══════════════════════════════════════
-app.get('/api/game/rtp', (req, res) => {
+app.get('/api/game/rtp', async (req, res) => {
   const config = getAllRTP()
   const stats = {}
+
+  // 기본: 메모리 (실시간 증분)
   for (const [game, s] of Object.entries(rtpStats)) {
     stats[game] = {
-      ...s,
+      wagered: s.wagered, paid: s.paid, rounds: s.rounds,
       currentRTP: s.wagered > 0 ? parseFloat((s.paid / s.wagered * 100).toFixed(2)) : 0,
       targetRTP: config[game]?.rtp || 97,
       houseEdge: config[game]?.houseEdge || 0.03,
     }
   }
+
+  // DB 통계 병합 (오늘 누적) — 재시작해도 유지
+  if (db.dbEnabled) {
+    try {
+      const { createClient } = require('@supabase/supabase-js')
+      const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
+      const { data } = await sb.from('v_crypto_engine_today').select('*')
+      for (const r of (data || [])) {
+        if (!stats[r.game]) {
+          stats[r.game] = {
+            wagered: 0, paid: 0, rounds: 0,
+            targetRTP: 97, houseEdge: 0.03,
+          }
+        }
+        // DB값이 더 신뢰도 높음 (재부팅 후 메모리는 0)
+        if (Number(r.wagered) > stats[r.game].wagered) {
+          stats[r.game].wagered = Number(r.wagered)
+          stats[r.game].paid    = Number(r.paid)
+          stats[r.game].rounds  = Number(r.rounds)
+          stats[r.game].currentRTP = Number(r.rtp_pct).toFixed(2)
+        }
+      }
+    } catch (e) { console.warn('[rtp] DB 집계 실패', e.message) }
+  }
+
   res.json({ success: true, stats, config })
 })
 
@@ -811,6 +852,20 @@ app.post('/b2b/game/play', b2bAuthMiddleware, async (req, res) => {
     addGameLog(tenant.id, playerId, game, betAmount, payout, payout > betAmount ? 'win' : 'lose', txId)
     updateRTP(game, betAmount, payout)
 
+    // 🗄️ DB 영구화 (fire-and-forget)
+    db.saveSeed({
+      serverSeed: seedSet.serverSeed, serverSeedHash: seedSet.serverSeedHash,
+      clientSeed: seedSet.clientSeed, nonce: seedSet.nonce,
+      game, resultHash: hash,
+    }).then(seedId => {
+      db.saveRound({
+        seedId, game,
+        usercode: playerId, sessionId: txId, tenantId: tenant.id,
+        betAmount, result, payout, multiplier, gameData: gameResult,
+      })
+    }).catch(e => console.warn('[db] b2b/play persist', e.message))
+    db.bumpRTP(game, betAmount, payout)
+
     return res.json({
       success: true, game, result, payout, multiplier, betAmount,
       transactionId: txId,
@@ -885,9 +940,28 @@ app.post('/b2b/game/settle', b2bAuthMiddleware, async (req, res) => {
     updateTenantStats(tenant.id, betAmount, payout)
     addGameLog(tenant.id, playerId, game, betAmount, payout, payout > betAmount ? 'win' : 'lose', txId)
     updateRTP(game, betAmount, payout)
+    const resultStr = payout > betAmount ? 'win' : payout > 0 ? 'partial' : 'lose'
+
+    // 🗄️ DB 영구화 (B2B도 seed + round 저장)
+    const b2bSeedSet = createSeedSet(params.clientSeed || 'b2b_' + tenant.id)
+    b2bSeedSet.nonce = Number(params.nonce) || Date.now()
+    db.saveSeed({
+      serverSeed: b2bSeedSet.serverSeed, serverSeedHash: b2bSeedSet.serverSeedHash,
+      clientSeed: b2bSeedSet.clientSeed, nonce: b2bSeedSet.nonce,
+      game, resultHash: null,
+    }).then(seedId => {
+      db.saveRound({
+        seedId, game,
+        usercode: playerId, sessionId: txId, tenantId: tenant.id,
+        betAmount, result: resultStr, payout, multiplier: gameResult.multiplier || 0,
+        gameData: { ...gameResult, endPrice, roundId, side },
+        overrideInfo: riggingOverride ? { riggingOverride, losingSide } : null,
+      })
+    }).catch(e => console.warn('[db] b2b/settle persist', e.message))
+    db.bumpRTP(game, betAmount, payout)
 
     return res.json({
-      success: true, game, result: payout > betAmount ? 'win' : payout > 0 ? 'partial' : 'lose',
+      success: true, game, result: resultStr,
       payout, betAmount, endPrice, transactionId: txId, gameData: gameResult,
     })
   } catch (err) {

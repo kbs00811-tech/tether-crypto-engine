@@ -35,6 +35,15 @@ if (SUPABASE_URL && SERVICE_KEY) {
 }
 
 // ═══════════════════════════════════════
+// game 필드 정규화 (crash → crypto:crash)
+// B2C bet_records와 동일 형식 유지 → cross-DB 조인 가능
+// ═══════════════════════════════════════
+function normalizeGame(g) {
+  if (!g) return g
+  return g.startsWith('crypto:') ? g : `crypto:${g}`
+}
+
+// ═══════════════════════════════════════
 // Seed 저장 (append-only)
 // ═══════════════════════════════════════
 async function saveSeed({ serverSeed, serverSeedHash, clientSeed, nonce, game, resultHash }) {
@@ -47,7 +56,7 @@ async function saveSeed({ serverSeed, serverSeedHash, clientSeed, nonce, game, r
         server_seed_hash: serverSeedHash,
         client_seed:      clientSeed || 'default',
         nonce:            Number(nonce) || 0,
-        game,
+        game:             normalizeGame(game),
         result_hash:      resultHash,
       })
       .select('id')
@@ -68,7 +77,7 @@ async function saveRound({ seedId, game, usercode, userId, sessionId, tenantId,
       .from('crypto_engine_rounds')
       .insert({
         seed_id:       seedId,
-        game,
+        game:          normalizeGame(game),
         usercode:      usercode || null,
         user_id:       userId || null,
         session_id:    sessionId || null,
@@ -90,7 +99,7 @@ async function saveRound({ seedId, game, usercode, userId, sessionId, tenantId,
 const rtpBatch = []  // 비동기 배치
 async function bumpRTP(game, wagered, paid) {
   if (!dbEnabled) return
-  rtpBatch.push({ game, wagered: Math.floor(wagered), paid: Math.floor(paid) })
+  rtpBatch.push({ game: normalizeGame(game), wagered: Math.floor(wagered), paid: Math.floor(paid) })
 }
 
 async function flushRTP() {
@@ -118,7 +127,9 @@ async function loadRigging() {
     if (error) { console.warn('[db] loadRigging', error.message); return null }
     const out = {}
     for (const r of (data || [])) {
-      out[r.game] = { enabled: !!r.enabled, threshold: Number(r.threshold) || 60 }
+      // DB는 crypto:* or bare 둘 다 가능 → 메모리는 bare 키로 통일 (roundManager가 bare 사용)
+      const key = r.game.replace(/^crypto:/, '')
+      out[key] = { enabled: !!r.enabled, threshold: Number(r.threshold) || 60 }
     }
     return out
   } catch (e) { console.warn('[db] loadRigging', e.message); return null }
@@ -128,8 +139,8 @@ async function saveRigging(game, enabled, threshold, updatedBy) {
   if (!dbEnabled) return false
   try {
     const { error } = await sb.from('crypto_engine_rigging').upsert({
-      game,
-      enabled: !!enabled,
+      game:     normalizeGame(game),
+      enabled:  !!enabled,
       threshold: Number(threshold) || 60,
       updated_at: new Date().toISOString(),
       updated_by: updatedBy || null,
@@ -159,7 +170,7 @@ async function saveUserRtp(usercode, game, rtp, updatedBy) {
   if (!dbEnabled) return false
   try {
     const { error } = await sb.from('crypto_engine_user_rtp').upsert({
-      usercode, game, rtp: Number(rtp),
+      usercode, game: normalizeGame(game), rtp: Number(rtp),
       updated_at: new Date().toISOString(),
       updated_by: updatedBy || null,
     }, { onConflict: 'usercode,game' })
