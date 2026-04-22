@@ -22,9 +22,11 @@ const {
   getAllRTP, setHouseEdge, getRTP,
 } = require('./games')
 const {
+  bootstrap: bootstrapRounds,
   recordBet, getLosingSide, overrideResult,
   getRoundSummary, setRigging, getRiggingConfig,
 } = require('./roundManager')
+const db = require('./db')
 
 const app = express()
 app.use(cors())
@@ -80,7 +82,7 @@ app.get('/health', (req, res) => {
 // ═══════════════════════════════════════
 // POST /api/game/play — 즉시 정산 게임
 // ═══════════════════════════════════════
-app.post('/api/game/play', (req, res) => {
+app.post('/api/game/play', async (req, res) => {
   try {
     const { game, amount, params = {} } = req.body
     if (!game || !amount || amount <= 0) {
@@ -133,6 +135,21 @@ app.post('/api/game/play', (req, res) => {
 
     updateRTP(game, betAmount, payout)
 
+    // 🗄️ DB 영구 저장 (fire-and-forget, 게임 응답 지연 없음)
+    const seedId = await db.saveSeed({
+      serverSeed: seedSet.serverSeed,
+      serverSeedHash: seedSet.serverSeedHash,
+      clientSeed: seedSet.clientSeed,
+      nonce: seedSet.nonce,
+      game, resultHash: hash,
+    })
+    db.saveRound({
+      seedId, game,
+      usercode: params.usercode, userId: params.userId,
+      betAmount, result, payout, multiplier, gameData: gameResult,
+    })
+    db.bumpRTP(game, betAmount, payout)
+
     return res.json({
       success: true,
       game,
@@ -156,7 +173,7 @@ app.post('/api/game/play', (req, res) => {
 // ═══════════════════════════════════════
 // POST /api/game/mines/start — Mines 게임 시작
 // ═══════════════════════════════════════
-app.post('/api/game/mines/start', (req, res) => {
+app.post('/api/game/mines/start', async (req, res) => {
   try {
     const { amount, params = {} } = req.body
     if (!amount || amount <= 0) return res.json({ success: false, error: 'amount required' })
@@ -169,6 +186,16 @@ app.post('/api/game/mines/start', (req, res) => {
     const gameResult = mines(hash, params)
     const sessionId = crypto.randomBytes(16).toString('hex')
 
+    // 🗄️ seed 저장
+    const seedId = await db.saveSeed({
+      serverSeed: seedSet.serverSeed,
+      serverSeedHash: seedSet.serverSeedHash,
+      clientSeed: seedSet.clientSeed,
+      nonce: seedSet.nonce,
+      game: 'mines', resultHash: hash,
+    })
+
+    // 메모리 + DB 이중 저장 (메모리는 빠른 read, DB는 장애 복구)
     mineSessions.set(sessionId, {
       mines: gameResult.mines,
       mineCount: gameResult.mineCount,
@@ -176,11 +203,20 @@ app.post('/api/game/mines/start', (req, res) => {
       betAmount,
       seedSet,
       hash,
+      seedId,
+      usercode: params.usercode,
       createdAt: Date.now(),
     })
 
-    // 5분 후 자동 만료
-    setTimeout(() => mineSessions.delete(sessionId), 5 * 60 * 1000)
+    // DB 저장 (TTL 1시간 - 기존 5분에서 연장, 장애 복구 가능)
+    db.createMinesSession({
+      sessionId, usercode: params.usercode,
+      betAmount, mineCount: gameResult.mineCount,
+      mines: gameResult.mines, seedId, ttlMinutes: 60,
+    })
+
+    // 1시간 후 메모리 정리
+    setTimeout(() => mineSessions.delete(sessionId), 60 * 60 * 1000)
 
     return res.json({
       success: true,
@@ -197,10 +233,25 @@ app.post('/api/game/mines/start', (req, res) => {
 // ═══════════════════════════════════════
 // POST /api/game/mines/reveal — 타일 오픈
 // ═══════════════════════════════════════
-app.post('/api/game/mines/reveal', (req, res) => {
+app.post('/api/game/mines/reveal', async (req, res) => {
   try {
     const { sessionId, tileIndex } = req.body
-    const session = mineSessions.get(sessionId)
+
+    // 메모리 hit → DB fallback (엔진 재시작 후 복구)
+    let session = mineSessions.get(sessionId)
+    if (!session) {
+      const dbSession = await db.getMinesSession(sessionId)
+      if (dbSession) {
+        session = {
+          mines: dbSession.mines, mineCount: dbSession.mine_count,
+          revealed: dbSession.revealed || [], betAmount: Number(dbSession.bet_amount),
+          seedSet: null,  // 복구 시엔 seed 없이 동작 (보호)
+          seedId: dbSession.seed_id, usercode: dbSession.usercode,
+          createdAt: Date.now(),
+        }
+        mineSessions.set(sessionId, session)
+      }
+    }
     if (!session) return res.json({ success: false, error: 'session expired' })
 
     const idx = Number(tileIndex)
@@ -210,10 +261,24 @@ app.post('/api/game/mines/reveal', (req, res) => {
     const isMine = session.mines.includes(idx)
     session.revealed.push(idx)
 
+    // DB 업데이트 (fire-and-forget)
+    db.updateMinesReveal(sessionId, session.revealed)
+
     if (isMine) {
-      // 지뢰 밟음 → 게임 종료
       const payout = 0
       updateRTP('mines', session.betAmount, payout)
+      db.bumpRTP('mines', session.betAmount, payout)
+
+      // DB 세션 종료 + round 저장
+      db.closeMinesSession(sessionId, 'exploded', { revealed: session.revealed, mines: session.mines })
+      db.saveRound({
+        seedId: session.seedId, game: 'mines',
+        usercode: session.usercode, sessionId,
+        betAmount: session.betAmount, result: 'lose',
+        payout: 0, multiplier: 0,
+        gameData: { mines: session.mines, revealed: session.revealed, explodedAt: idx },
+      })
+
       mineSessions.delete(sessionId)
 
       return res.json({
@@ -224,12 +289,12 @@ app.post('/api/game/mines/reveal', (req, res) => {
         mines: session.mines,
         payout: 0,
         multiplier: 0,
-        seed: {
+        seed: session.seedSet ? {
           serverSeed: session.seedSet.serverSeed,
           serverSeedHash: session.seedSet.serverSeedHash,
           clientSeed: session.seedSet.clientSeed,
           nonce: session.seedSet.nonce,
-        },
+        } : null,
       })
     }
 
@@ -255,16 +320,38 @@ app.post('/api/game/mines/reveal', (req, res) => {
 // ═══════════════════════════════════════
 // POST /api/game/mines/cashout — 캐시아웃
 // ═══════════════════════════════════════
-app.post('/api/game/mines/cashout', (req, res) => {
+app.post('/api/game/mines/cashout', async (req, res) => {
   try {
     const { sessionId } = req.body
-    const session = mineSessions.get(sessionId)
+    let session = mineSessions.get(sessionId)
+    if (!session) {
+      const dbSession = await db.getMinesSession(sessionId)
+      if (dbSession) {
+        session = {
+          mines: dbSession.mines, mineCount: dbSession.mine_count,
+          revealed: dbSession.revealed || [], betAmount: Number(dbSession.bet_amount),
+          seedSet: null, seedId: dbSession.seed_id, usercode: dbSession.usercode,
+        }
+      }
+    }
     if (!session) return res.json({ success: false, error: 'session expired' })
 
     const mult = minesMultiplier(session.mineCount, session.revealed.length)
     const payout = Math.floor(session.betAmount * mult)
 
     updateRTP('mines', session.betAmount, payout)
+    db.bumpRTP('mines', session.betAmount, payout)
+
+    // DB 저장
+    db.closeMinesSession(sessionId, 'cashout', { revealed: session.revealed, mines: session.mines, payout, multiplier: mult })
+    db.saveRound({
+      seedId: session.seedId, game: 'mines',
+      usercode: session.usercode, sessionId,
+      betAmount: session.betAmount, result: 'cashout',
+      payout, multiplier: mult,
+      gameData: { mines: session.mines, revealed: session.revealed },
+    })
+
     mineSessions.delete(sessionId)
 
     return res.json({
@@ -274,12 +361,12 @@ app.post('/api/game/mines/cashout', (req, res) => {
       multiplier: mult,
       revealed: session.revealed,
       mines: session.mines,
-      seed: {
+      seed: session.seedSet ? {
         serverSeed: session.seedSet.serverSeed,
         serverSeedHash: session.seedSet.serverSeedHash,
         clientSeed: session.seedSet.clientSeed,
         nonce: session.seedSet.nonce,
-      },
+      } : null,
     })
   } catch (err) {
     res.status(500).json({ success: false, error: err.message })
@@ -356,6 +443,18 @@ app.post('/api/game/settle', async (req, res) => {
 
     updateRTP(game, betAmount, payout)
 
+    // 🗄️ DB 저장 — 가격 게임은 seed 없이 round만 (가격 기반이라 seed 의미 적음)
+    db.saveRound({
+      seedId: null, game,
+      usercode: params.usercode, userId: params.userId,
+      betAmount, result: payout > betAmount ? 'win' : payout > 0 ? 'partial' : 'lose',
+      payout,
+      multiplier: gameResult.multiplier || 0,
+      gameData: { ...gameResult, endPrice, roundId, side },
+      overrideInfo: riggingOverride ? { riggingOverride, losingSide } : null,
+    })
+    db.bumpRTP(game, betAmount, payout)
+
     return res.json({
       success: true,
       game,
@@ -399,15 +498,15 @@ app.get('/api/game/round/:game/:roundId', (req, res) => {
 // ═══════════════════════════════════════
 // POST /api/game/rigging/set — 리깅 설정 (어드민)
 // ═══════════════════════════════════════
-app.post('/api/game/rigging/set', (req, res) => {
+app.post('/api/game/rigging/set', async (req, res) => {
   try {
-    const { game, enabled, threshold, apiKey } = req.body
+    const { game, enabled, threshold, apiKey, adminEmail } = req.body
     const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
     if (apiKey !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'unauthorized' })
 
     if (!game) return res.json({ success: false, error: 'game required' })
 
-    const result = setRigging(game, enabled, threshold)
+    const result = await setRigging(game, enabled, threshold, adminEmail ? `admin:${adminEmail}` : null)
     console.log(`[Admin] Rigging ${game}: enabled=${result.enabled}, threshold=${result.threshold}%`)
 
     return res.json({ success: true, game, config: result, allConfig: getRiggingConfig() })
@@ -548,9 +647,9 @@ app.post('/api/game/rtp/batch', (req, res) => {
 })
 
 // ═══════════════════════════════════════
-// 유저별 RTP 조정 (서버 저장)
+// 유저별 RTP 조정 (메모리 캐시 + DB 영구)
 // ═══════════════════════════════════════
-const userRtpConfig = {}
+const userRtpConfig = {}  // 서버 시작 시 DB 로드
 
 app.get('/api/game/user-rtp', (req, res) => {
   const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
@@ -558,23 +657,44 @@ app.get('/api/game/user-rtp', (req, res) => {
   res.json({ success: true, config: userRtpConfig })
 })
 
-app.post('/api/game/user-rtp/set', (req, res) => {
-  const { usercode, adjustments, apiKey } = req.body
+app.post('/api/game/user-rtp/set', async (req, res) => {
+  const { usercode, adjustments, apiKey, adminEmail } = req.body
   const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
   if (apiKey !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'unauthorized' })
   if (!usercode) return res.json({ success: false, error: 'usercode required' })
 
-  userRtpConfig[usercode] = adjustments || {}
-  console.log(`[Admin] User RTP set: ${usercode}`, adjustments)
+  // DB 저장 (게임별)
+  const adj = adjustments || {}
+  const updatedBy = adminEmail ? `admin:${adminEmail}` : null
+  for (const [game, rtp] of Object.entries(adj)) {
+    await db.saveUserRtp(usercode, game, Number(rtp), updatedBy)
+  }
+  // 메모리 갱신
+  userRtpConfig[usercode] = adj
+  console.log(`[Admin] User RTP set: ${usercode}`, adj)
   res.json({ success: true, usercode, adjustments: userRtpConfig[usercode], allUsers: Object.keys(userRtpConfig) })
 })
 
-app.post('/api/game/user-rtp/delete', (req, res) => {
+app.post('/api/game/user-rtp/delete', async (req, res) => {
   const { usercode, apiKey } = req.body
   const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
   if (apiKey !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'unauthorized' })
+  await db.deleteUserRtp(usercode)
   delete userRtpConfig[usercode]
   res.json({ success: true, deleted: usercode })
+})
+
+// ═══════════════════════════════════════
+// GET /api/game/reveal-seed — 종료된 라운드의 seed 공개 (Provably Fair)
+// ═══════════════════════════════════════
+app.get('/api/game/reveal-seed/:hash', async (req, res) => {
+  try {
+    const data = await db.revealSeed(req.params.hash)
+    if (!data) return res.json({ success: false, error: 'not_found' })
+    res.json({ success: true, seed: data })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
 })
 
 // ═══════════════════════════════════════
@@ -1133,16 +1253,36 @@ checkBalance();
 })
 
 // ═══════════════════════════════════════
-// 서버 시작
+// 서버 시작 — DB 설정 로드 후 listen
 // ═══════════════════════════════════════
-app.listen(PORT, () => {
-  console.log(`
+async function start() {
+  // 1. 리깅 설정 DB 로드
+  try { await bootstrapRounds() } catch (e) { console.warn('[bootstrap] rigging', e.message) }
+
+  // 2. 유저 RTP DB 로드
+  try {
+    const loaded = await db.loadUserRtp()
+    if (loaded) {
+      Object.assign(userRtpConfig, loaded)
+      console.log(`[bootstrap] 유저 RTP 로드: ${Object.keys(loaded).length}명`)
+    }
+  } catch (e) { console.warn('[bootstrap] userRtp', e.message) }
+
+  app.listen(PORT, () => {
+    console.log(`
 ╔══════════════════════════════════════════╗
-║  TETHER.BET Crypto Game Engine          ║
+║  TETHER.BET Crypto Game Engine v1.1     ║
 ║  Port: ${PORT}                              ║
 ║  Games: 8 (Provably Fair) + Holdem      ║
 ║  Mode: B2C + B2B API                    ║
+║  DB: ${db.dbEnabled ? 'Supabase (영구화 ON)' : '메모리 전용 (fallback)'}  ║
 ║  Status: READY                           ║
 ╚══════════════════════════════════════════╝
-  `)
+    `)
+  })
+}
+
+start().catch(err => {
+  console.error('[fatal] 서버 시작 실패:', err)
+  process.exit(1)
 })
