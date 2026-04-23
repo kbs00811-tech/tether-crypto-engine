@@ -20,18 +20,71 @@ const houseEdgeConfig = {
   futures: 0.06,   // RTP 94%
 }
 
-function getHouseEdge(game) {
+// ═══════════════════════════════════════
+// 유저별 RTP 오버라이드 (P0 수정: 실제 게임 계산에 반영)
+// 형식: { usercode: { game: rtp_decimal } } 예: { 'vip01': { dice: 1.02 } }
+// ═══════════════════════════════════════
+const userRtpOverride = {}
+
+// DB 영구화 훅 — server.js가 bootstrap에서 주입
+let _persistHouseEdge = null  // async (game, edge) => void
+function setHouseEdgePersister(fn) { _persistHouseEdge = fn }
+
+function getHouseEdge(game, usercode) {
+  // 유저 RTP 우선 (VIP 조정)
+  if (usercode && userRtpOverride[usercode]?.[game] != null) {
+    return 1 - userRtpOverride[usercode][game]
+  }
   return houseEdgeConfig[game] ?? 0.03
 }
 
-function getRTP(game) {
-  return parseFloat(((1 - getHouseEdge(game)) * 100).toFixed(2))
+function getRTP(game, usercode) {
+  return parseFloat(((1 - getHouseEdge(game, usercode)) * 100).toFixed(2))
 }
 
 function setHouseEdge(game, edge) {
-  if (edge < 0.005 || edge > 0.20) return false  // 0.5%~20% 범위
+  if (edge < 0.005 || edge > 0.20) return false
   houseEdgeConfig[game] = edge
+  // DB 영구화 (있으면)
+  if (_persistHouseEdge) _persistHouseEdge(game, edge).catch(e => console.warn('[houseEdge persist]', e.message))
   return true
+}
+
+function loadHouseEdgeFromDB(dbConfig) {
+  if (!dbConfig || typeof dbConfig !== 'object') return
+  for (const [game, edge] of Object.entries(dbConfig)) {
+    if (typeof edge === 'number' && edge >= 0.005 && edge <= 0.20) {
+      houseEdgeConfig[game] = edge
+    }
+  }
+}
+
+function setUserRtp(usercode, game, rtp) {
+  if (!usercode || !game) return false
+  // rtp 범위 제한: 0.80 (80%) ~ 1.20 (120%)
+  const clamped = Math.max(0.80, Math.min(1.20, Number(rtp)))
+  if (!userRtpOverride[usercode]) userRtpOverride[usercode] = {}
+  userRtpOverride[usercode][game] = clamped
+  return true
+}
+
+function deleteUserRtp(usercode, game) {
+  if (!usercode) return false
+  if (game) {
+    if (userRtpOverride[usercode]) delete userRtpOverride[usercode][game]
+  } else {
+    delete userRtpOverride[usercode]
+  }
+  return true
+}
+
+function loadUserRtpFromDB(dbUserRtp) {
+  if (!dbUserRtp || typeof dbUserRtp !== 'object') return
+  for (const [usercode, games] of Object.entries(dbUserRtp)) {
+    for (const [game, rtp] of Object.entries(games || {})) {
+      setUserRtp(usercode, game, rtp)
+    }
+  }
 }
 
 function getAllRTP() {
@@ -47,11 +100,11 @@ function getAllRTP() {
 // ═══════════════════════════════════════
 // 1. CRASH — 로켓 배수 게임
 // ═══════════════════════════════════════
-// Crash — 하우스 엣지 동적 적용
-function crash(hash) {
+// Crash — 하우스 엣지 동적 적용 (유저 RTP 오버라이드 반영)
+function crash(hash, params = {}) {
   const h = parseInt(hash.slice(0, 13), 16)
   const e = Math.pow(2, 52)
-  const edge = getHouseEdge('crash')
+  const edge = getHouseEdge('crash', params.usercode)
 
   // 즉사 확률 = 하우스 엣지 (예: 3% → h%33===0)
   const instantCrashMod = Math.max(2, Math.round(1 / edge))
@@ -72,7 +125,7 @@ function dice(hash, params) {
 
   const won = isOver ? (roll > target) : (roll < target)
   const winChance = isOver ? (100 - target) : target
-  const rtp = 100 - (getHouseEdge('dice') * 100)
+  const rtp = 100 - (getHouseEdge('dice', params.usercode) * 100)  // 🔒 유저 RTP 반영
   const multiplier = won ? parseFloat((rtp / winChance).toFixed(4)) : 0
 
   return { roll, target, direction: params.direction, won, multiplier, winChance }
@@ -96,14 +149,14 @@ function mines(hash, params) {
   return { mines: minePositions, mineCount, gridSize: 25 }
 }
 
-// Mines 배당 계산 (n번째 안전 타일 오픈 후)
-function minesMultiplier(mineCount, revealedCount) {
+// Mines 배당 계산 (n번째 안전 타일 오픈 후) — usercode 선택적 전달
+function minesMultiplier(mineCount, revealedCount, usercode) {
   if (revealedCount <= 0) return 1
   let mult = 1
   for (let i = 0; i < revealedCount; i++) {
     mult *= (25 - mineCount - i) > 0 ? (25 - i) / (25 - mineCount - i) : 1
   }
-  return parseFloat((mult * (1 - getHouseEdge('mines'))).toFixed(4))
+  return parseFloat((mult * (1 - getHouseEdge('mines', usercode))).toFixed(4))
 }
 
 // ═══════════════════════════════════════
@@ -140,14 +193,13 @@ function plinko(hash, params) {
 // 5. UP/DOWN — 60초 가격 예측
 // ═══════════════════════════════════════
 // RTP: 97.5% (배당 1.95x × 50%)
-function updownSettle(startPrice, endPrice, side) {
+function updownSettle(startPrice, endPrice, side, usercode) {
   let won = false
   if (side === 'UP' && endPrice > startPrice) won = true
   if (side === 'DOWN' && endPrice < startPrice) won = true
-  // 동가 → 무승부 (환불)
   if (endPrice === startPrice) return { won: false, tie: true, multiplier: 1.0 }
 
-  const payout = parseFloat((2 * (1 - getHouseEdge('updown'))).toFixed(4))  // ~1.95
+  const payout = parseFloat((2 * (1 - getHouseEdge('updown', usercode))).toFixed(4))
   return { won, tie: false, multiplier: won ? payout : 0 }
 }
 
@@ -155,13 +207,13 @@ function updownSettle(startPrice, endPrice, side) {
 // 6. HI/LO — 목표가 예측
 // ═══════════════════════════════════════
 // RTP: 97% (배당 1.97x)
-function hiloSettle(targetPrice, endPrice, side) {
+function hiloSettle(targetPrice, endPrice, side, usercode) {
   let won = false
   if (side === 'HIGHER' && endPrice > targetPrice) won = true
   if (side === 'LOWER' && endPrice < targetPrice) won = true
   if (endPrice === targetPrice) return { won: false, tie: true, multiplier: 1.0 }
 
-  const payout = parseFloat((2 * (1 - getHouseEdge('hilo'))).toFixed(4))  // ~1.94
+  const payout = parseFloat((2 * (1 - getHouseEdge('hilo', usercode))).toFixed(4))
   return { won, tie: false, multiplier: won ? payout : 0 }
 }
 
@@ -229,4 +281,7 @@ module.exports = {
   updownSettle, hiloSettle, spreadSettle,
   futuresSettle, futuresLiquidationPrice,
   houseEdgeConfig, getHouseEdge, getRTP, setHouseEdge, getAllRTP,
+  // 🆕 유저 RTP + DB 영구화 훅
+  setUserRtp, deleteUserRtp, loadUserRtpFromDB,
+  loadHouseEdgeFromDB, setHouseEdgePersister,
 }

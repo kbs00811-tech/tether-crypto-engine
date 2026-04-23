@@ -20,6 +20,8 @@ const {
   updownSettle, hiloSettle, spreadSettle,
   futuresSettle, futuresLiquidationPrice,
   getAllRTP, setHouseEdge, getRTP,
+  setUserRtp: gamesSetUserRtp, deleteUserRtp: gamesDeleteUserRtp,
+  loadUserRtpFromDB, loadHouseEdgeFromDB, setHouseEdgePersister,
 } = require('./games')
 const {
   bootstrap: bootstrapRounds,
@@ -96,9 +98,12 @@ app.post('/api/game/play', async (req, res) => {
 
     let gameResult, result = 'lose', payout = 0, multiplier = 0
 
+    // 🔒 usercode를 params에 주입 (game 함수가 유저 RTP 오버라이드 적용)
+    const paramsWithUser = { ...params, usercode: params.usercode }
+
     switch (game) {
       case 'crash': {
-        gameResult = crash(hash)
+        gameResult = crash(hash, paramsWithUser)
         const target = Number(params.cashoutAt) || 2.0
         if (gameResult.crashPoint >= target) {
           result = 'win'
@@ -112,7 +117,7 @@ app.post('/api/game/play', async (req, res) => {
       }
 
       case 'dice': {
-        gameResult = dice(hash, params)
+        gameResult = dice(hash, paramsWithUser)
         if (gameResult.won) {
           result = 'win'
           multiplier = gameResult.multiplier
@@ -122,7 +127,7 @@ app.post('/api/game/play', async (req, res) => {
       }
 
       case 'plinko': {
-        gameResult = plinko(hash, params)
+        gameResult = plinko(hash, paramsWithUser)
         multiplier = gameResult.multiplier
         payout = Math.floor(betAmount * multiplier)
         result = payout > betAmount ? 'win' : 'lose'
@@ -298,8 +303,8 @@ app.post('/api/game/mines/reveal', async (req, res) => {
       })
     }
 
-    // 안전 타일
-    const currentMult = minesMultiplier(session.mineCount, session.revealed.length)
+    // 안전 타일 — 유저 RTP 반영
+    const currentMult = minesMultiplier(session.mineCount, session.revealed.length, session.usercode)
     const safeRemaining = 25 - session.mineCount - session.revealed.length
 
     return res.json({
@@ -309,7 +314,7 @@ app.post('/api/game/mines/reveal', async (req, res) => {
       tileIndex: idx,
       revealed: session.revealed,
       multiplier: currentMult,
-      nextMultiplier: safeRemaining > 0 ? minesMultiplier(session.mineCount, session.revealed.length + 1) : currentMult,
+      nextMultiplier: safeRemaining > 0 ? minesMultiplier(session.mineCount, session.revealed.length + 1, session.usercode) : currentMult,
       safeRemaining,
     })
   } catch (err) {
@@ -336,7 +341,7 @@ app.post('/api/game/mines/cashout', async (req, res) => {
     }
     if (!session) return res.json({ success: false, error: 'session expired' })
 
-    const mult = minesMultiplier(session.mineCount, session.revealed.length)
+    const mult = minesMultiplier(session.mineCount, session.revealed.length, session.usercode)
     const payout = Math.floor(session.betAmount * mult)
 
     updateRTP('mines', session.betAmount, payout)
@@ -402,7 +407,7 @@ app.post('/api/game/settle', async (req, res) => {
     switch (game) {
       case 'updown': {
         const startPrice = Number(params.startPrice)
-        gameResult = updownSettle(startPrice, endPrice, side)
+        gameResult = updownSettle(startPrice, endPrice, side, params.usercode)
         // 리깅 적용: 원래 결과를 오버라이드
         if (riggingOverride === 'lose' && gameResult.won) {
           gameResult.won = false; gameResult.multiplier = 0; gameResult.rigged = true
@@ -414,7 +419,7 @@ app.post('/api/game/settle', async (req, res) => {
       }
       case 'hilo': {
         const targetPrice = Number(params.targetPrice)
-        gameResult = hiloSettle(targetPrice, endPrice, side)
+        gameResult = hiloSettle(targetPrice, endPrice, side, params.usercode)
         if (riggingOverride === 'lose' && gameResult.won) {
           gameResult.won = false; gameResult.multiplier = 0; gameResult.rigged = true
         } else if (riggingOverride === 'win' && !gameResult.won && !gameResult.tie) {
@@ -704,13 +709,13 @@ app.post('/api/game/user-rtp/set', async (req, res) => {
   if (apiKey !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'unauthorized' })
   if (!usercode) return res.json({ success: false, error: 'usercode required' })
 
-  // DB 저장 (게임별)
   const adj = adjustments || {}
   const updatedBy = adminEmail ? `admin:${adminEmail}` : null
   for (const [game, rtp] of Object.entries(adj)) {
     await db.saveUserRtp(usercode, game, Number(rtp), updatedBy)
+    // 🔒 games.js 내부 저장소에도 즉시 반영 (게임 계산에 실제 적용)
+    gamesSetUserRtp(usercode, game, Number(rtp))
   }
-  // 메모리 갱신
   userRtpConfig[usercode] = adj
   console.log(`[Admin] User RTP set: ${usercode}`, adj)
   res.json({ success: true, usercode, adjustments: userRtpConfig[usercode], allUsers: Object.keys(userRtpConfig) })
@@ -721,6 +726,8 @@ app.post('/api/game/user-rtp/delete', async (req, res) => {
   const ADMIN_KEY = process.env.ADMIN_API_KEY || 'tether-crypto-admin-2026'
   if (apiKey !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'unauthorized' })
   await db.deleteUserRtp(usercode)
+  // 🔒 games.js에서도 제거
+  gamesDeleteUserRtp(usercode)
   delete userRtpConfig[usercode]
   res.json({ success: true, deleted: usercode })
 })
@@ -1333,12 +1340,24 @@ async function start() {
   // 1. 리깅 설정 DB 로드
   try { await bootstrapRounds() } catch (e) { console.warn('[bootstrap] rigging', e.message) }
 
-  // 2. 유저 RTP DB 로드
+  // 2. 🔒 기본 houseEdge DB 로드 + 저장 훅 등록
+  try {
+    const loadedEdge = await db.loadHouseEdge()
+    if (loadedEdge && Object.keys(loadedEdge).length > 0) {
+      loadHouseEdgeFromDB(loadedEdge)
+      console.log(`[bootstrap] 기본 houseEdge 로드: ${Object.keys(loadedEdge).length}개 게임`)
+    }
+    // setHouseEdge 호출 시 DB에도 저장되도록 훅 연결
+    setHouseEdgePersister(db.saveHouseEdge)
+  } catch (e) { console.warn('[bootstrap] houseEdge', e.message) }
+
+  // 3. 🔒 유저 RTP DB 로드 + games.js에 주입 (실제 게임 계산 반영)
   try {
     const loaded = await db.loadUserRtp()
     if (loaded) {
       Object.assign(userRtpConfig, loaded)
-      console.log(`[bootstrap] 유저 RTP 로드: ${Object.keys(loaded).length}명`)
+      loadUserRtpFromDB(loaded)  // games.js의 userRtpOverride로 주입
+      console.log(`[bootstrap] 유저 RTP 로드: ${Object.keys(loaded).length}명 (games.js 반영 완료)`)
     }
   } catch (e) { console.warn('[bootstrap] userRtp', e.message) }
 

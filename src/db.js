@@ -135,6 +135,47 @@ async function loadRigging() {
   } catch (e) { console.warn('[db] loadRigging', e.message); return null }
 }
 
+// ═══════════════════════════════════════
+// 🆕 houseEdge 영구화 (crypto_engine_rigging에 house_edge 컬럼 추가)
+// ═══════════════════════════════════════
+async function loadHouseEdge() {
+  if (!dbEnabled) return null
+  try {
+    const { data } = await sb.from('crypto_engine_rigging').select('game, house_edge')
+    const out = {}
+    for (const r of (data || [])) {
+      if (r.house_edge != null) {
+        const key = (r.game || '').replace(/^crypto:/, '')
+        out[key] = Number(r.house_edge)
+      }
+    }
+    return out
+  } catch (e) { console.warn('[db] loadHouseEdge', e.message); return null }
+}
+
+async function saveHouseEdge(game, edge) {
+  if (!dbEnabled) return false
+  try {
+    const g = normalizeGame(game)
+    // upsert — 해당 game의 house_edge만 업데이트 (rigging 필드 보존)
+    const { data: existing } = await sb.from('crypto_engine_rigging').select('*').eq('game', g).single()
+    if (existing) {
+      await sb.from('crypto_engine_rigging').update({
+        house_edge: Number(edge),
+        updated_at: new Date().toISOString(),
+      }).eq('game', g)
+    } else {
+      await sb.from('crypto_engine_rigging').insert({
+        game: g,
+        enabled: false,
+        threshold: 60,
+        house_edge: Number(edge),
+      })
+    }
+    return true
+  } catch (e) { console.warn('[db] saveHouseEdge', e.message); return false }
+}
+
 async function saveRigging(game, enabled, threshold, updatedBy) {
   if (!dbEnabled) return false
   try {
@@ -267,6 +308,7 @@ module.exports = {
   dbEnabled,
   saveSeed, saveRound, bumpRTP, flushRTP,
   loadRigging, saveRigging,
+  loadHouseEdge, saveHouseEdge,  // 🆕 houseEdge 영구화
   loadUserRtp, saveUserRtp, deleteUserRtp,
   createMinesSession, getMinesSession, updateMinesReveal, closeMinesSession,
   revealSeed,
