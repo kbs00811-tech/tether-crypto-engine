@@ -101,17 +101,20 @@ function getAllRTP() {
 // 1. CRASH — 로켓 배수 게임
 // ═══════════════════════════════════════
 // Crash — 하우스 엣지 동적 적용 (유저 RTP 오버라이드 반영)
+// randomFloat: hash[16..28]에서 추출한 0~1 균등분포 — Cases/Pump 등 변환 게임이 사용
 function crash(hash, params = {}) {
   const h = parseInt(hash.slice(0, 13), 16)
   const e = Math.pow(2, 52)
   const edge = getHouseEdge('crash', params.usercode)
+  // 별도 영역 (16~28)에서 추출 → crashPoint 결정 영역(0~13)과 독립적
+  const randomFloat = hashToFloat(hash, 16)
 
   // 즉사 확률 = 하우스 엣지 (예: 3% → h%33===0)
   const instantCrashMod = Math.max(2, Math.round(1 / edge))
-  if (h % instantCrashMod === 0) return { crashPoint: 1.00 }
+  if (h % instantCrashMod === 0) return { crashPoint: 1.00, randomFloat }
 
   const crashPoint = Math.floor((100 * e * (1 - edge)) / (e - h)) / 100
-  return { crashPoint: Math.min(Math.max(1.01, crashPoint), 100000) }
+  return { crashPoint: Math.min(Math.max(1.01, crashPoint), 100000), randomFloat }
 }
 
 // ═══════════════════════════════════════
