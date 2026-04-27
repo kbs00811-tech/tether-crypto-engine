@@ -16,7 +16,7 @@ const cors = require('cors')
 const crypto = require('crypto')
 const { createSeedSet, getResultHash, hashSeed, hmacResult } = require('./provablyFair')
 const {
-  crash, dice, mines, minesMultiplier, plinko,
+  crash, dice, mines, minesMultiplier, plinko, pump,
   updownSettle, hiloSettle, spreadSettle,
   futuresSettle, futuresLiquidationPrice,
   getAllRTP, setHouseEdge, getRTP,
@@ -50,6 +50,7 @@ const rtpStats = {
   dice:    { wagered: 0, paid: 0, rounds: 0 },
   mines:   { wagered: 0, paid: 0, rounds: 0 },
   plinko:  { wagered: 0, paid: 0, rounds: 0 },
+  pump:    { wagered: 0, paid: 0, rounds: 0 },
   updown:  { wagered: 0, paid: 0, rounds: 0 },
   hilo:    { wagered: 0, paid: 0, rounds: 0 },
   spread:  { wagered: 0, paid: 0, rounds: 0 },
@@ -131,6 +132,14 @@ app.post('/api/game/play', async (req, res) => {
         multiplier = gameResult.multiplier
         payout = Math.floor(betAmount * multiplier)
         result = payout > betAmount ? 'win' : 'lose'
+        break
+      }
+
+      case 'pump': {
+        // popAt 결정만 (cashout은 클라가 펌프 횟수 기준 호출)
+        gameResult = pump(hash, paramsWithUser)
+        multiplier = 0  // 베팅 시점에는 0 — cashout 시 betAmount 반환은 별도 처리
+        payout = 0
         break
       }
 

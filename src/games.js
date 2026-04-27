@@ -178,6 +178,24 @@ function minesMultiplier(mineCount, revealedCount, usercode) {
 }
 
 // ═══════════════════════════════════════
+// 3-2. PUMP — 풍선 펌프 (geometric distribution)
+// ═══════════════════════════════════════
+// hash → randomFloat → popAt (geometric inverse CDF) → multiplier
+// P(popAt = k) = (1-p)^(k-1) × p (정확)
+// RTP = 1 - houseEdge (모든 cashout 전략에서 동일)
+// houseEdge: 게임 설정 (기본 0.02 = RTP 98%)
+function pump(hash, params = {}) {
+  const popProb = Math.max(0.001, Math.min(0.999, Number(params.popProb) || 0.10))
+  const r = hashToFloat(hash, 16)  // 0~1 균등 (crashPoint 영역과 독립)
+  // inverse CDF — 정확한 geometric 분포
+  const popAt = Math.max(1, Math.floor(Math.log(1 - r) / Math.log(1 - popProb)) + 1)
+  const houseEdge = getHouseEdge('pump', params.usercode) || 0.02
+  // popAt-1까지 cashout 가능 → 최대 multiplier = (1-h) / (1-p)^(popAt-1)
+  const maxMultiplier = parseFloat(((1 - houseEdge) / Math.pow(1 - popProb, popAt - 1)).toFixed(6))
+  return { popAt, popProb, randomFloat: r, maxMultiplier, houseEdge }
+}
+
+// ═══════════════════════════════════════
 // 4. PLINKO — 핀볼 낙하
 // ═══════════════════════════════════════
 // RTP: ~97% (배당 테이블로 조정)
@@ -295,7 +313,7 @@ function futuresLiquidationPrice(entryPrice, side, leverage) {
 }
 
 module.exports = {
-  crash, dice, mines, minesMultiplier, plinko,
+  crash, dice, mines, minesMultiplier, plinko, pump,
   updownSettle, hiloSettle, spreadSettle,
   futuresSettle, futuresLiquidationPrice,
   houseEdgeConfig, getHouseEdge, getRTP, setHouseEdge, getAllRTP,
