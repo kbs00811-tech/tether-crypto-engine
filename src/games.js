@@ -115,20 +115,35 @@ function crash(hash, params = {}) {
 }
 
 // ═══════════════════════════════════════
-// 2. DICE — 주사위 (0~100 범위)
+// 2. DICE — 주사위 2개 합 OVER/UNDER (2~12)
 // ═══════════════════════════════════════
 // RTP: 97% (배당에 0.97 반영)
+// hash[0..7] → d1 (1~6), hash[8..15] → d2 (1~6), sum = d1 + d2 (2~12)
+// target 범위: OVER 2~11, UNDER 3~12 (sum == target이면 LOSE)
+const DICE_SUM_COUNTS = { 2:1, 3:2, 4:3, 5:4, 6:5, 7:6, 8:5, 9:4, 10:3, 11:2, 12:1 }
+function diceWinChance(target, isOver) {
+  let count = 0
+  for (let s = 2; s <= 12; s++) {
+    if (isOver ? s > target : s < target) count += DICE_SUM_COUNTS[s]
+  }
+  return (count / 36) * 100
+}
+
 function dice(hash, params) {
-  const roll = hashToInt(hash, 10000) / 100  // 0.00 ~ 100.00
-  const target = Number(params.target) || 50
+  const d1 = (parseInt(hash.slice(0, 8), 16) % 6) + 1   // 1~6
+  const d2 = (parseInt(hash.slice(8, 16), 16) % 6) + 1  // 1~6
+  const sum = d1 + d2                                   // 2~12
+
+  const target = Math.max(2, Math.min(12, Number(params.target) || 7))
   const isOver = params.direction === 'over'
 
-  const won = isOver ? (roll > target) : (roll < target)
-  const winChance = isOver ? (100 - target) : target
+  const won = isOver ? (sum > target) : (sum < target)
+  const winChance = diceWinChance(target, isOver)
   const rtp = 100 - (getHouseEdge('dice', params.usercode) * 100)  // 🔒 유저 RTP 반영
-  const multiplier = won ? parseFloat((rtp / winChance).toFixed(4)) : 0
+  const multiplier = won && winChance > 0 ? parseFloat((rtp / winChance).toFixed(4)) : 0
 
-  return { roll, target, direction: params.direction, won, multiplier, winChance }
+  // roll 필드는 호환성을 위해 sum 값으로 (기존 클라가 roll 참조해도 안 깨짐)
+  return { roll: sum, sum, dice1: d1, dice2: d2, target, direction: params.direction, won, multiplier, winChance: parseFloat(winChance.toFixed(4)) }
 }
 
 // ═══════════════════════════════════════
