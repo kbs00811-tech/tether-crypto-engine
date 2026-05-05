@@ -256,17 +256,24 @@ function hiloSettle(targetPrice, endPrice, side, usercode) {
 // ═══════════════════════════════════════
 // 7. SPREAD — 가격 범위 예측 (180초)
 // ═══════════════════════════════════════
-// RTP: 95%
+// RTP: ~70% (절충안 적용 — 클라이언트와 동기화)
+// 보안: spreadPct 상한 0.05 (5%) — 변조 방어
 function spreadSettle(startPrice, endPrice, spreadPct) {
-  const high = startPrice * (1 + spreadPct)
-  const low = startPrice * (1 - spreadPct)
+  // P0 보안: spreadPct 클램프 (0.0001 ~ 0.05) — 사용자 변조 방어
+  const safePct = Math.max(0.0001, Math.min(0.05, Number(spreadPct) || 0.01))
+
+  const high = startPrice * (1 + safePct)
+  const low = startPrice * (1 - safePct)
   const inRange = endPrice >= low && endPrice <= high
 
-  // 스프레드별 배당
-  let payout = 1.2
-  if (spreadPct <= 0.005) payout = 3.5
-  else if (spreadPct <= 0.01) payout = 2.2
-  else if (spreadPct <= 0.02) payout = 1.6
+  // 스프레드별 배당 — 클라이언트 SpreadPage.jsx DEFAULT_SPREADS 와 동기화
+  // 변동성 1% (BTC 평균) 기준: tight=0.9% (mult 0.9), medium=1.5%, wide=2.2%, vwide=3.5%
+  // safePct 임계값으로 매핑 (변동성 변동 흡수)
+  let payout = 2.6  // VWide 기본 (가장 넓은 범위)
+  if (safePct <= 0.012) payout = 7.8       // Tight (~0.9% 이하)
+  else if (safePct <= 0.018) payout = 4.8  // Medium (~1.5%)
+  else if (safePct <= 0.028) payout = 3.5  // Wide (~2.2%)
+  // else VWide payout 2.6
 
   return { won: inRange, multiplier: inRange ? payout : 0, rangeHigh: high, rangeLow: low }
 }
